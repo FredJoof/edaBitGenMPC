@@ -6,7 +6,7 @@ use diet_mac_and_cheese::{
         CheddaConvProverV2Xor4Maj7, CheddaConvVerifierV1TSPA, CheddaConvVerifierV1Xor4Maj7,
         CheddaConvVerifierV2TSPA, CheddaConvVerifierV2Xor4Maj7,
     },
-    conv::{ConvProverFromHomComsT, ConvVerifierFromHomComsT},
+    conv::{ConvProverFromHomComsT, ConvProverT, ConvVerifierFromHomComsT, ConvVerifierT},
     edabits::{
         random_edabits_prover, random_edabits_verifier, ProverConv as EdabitsConvProver, RcRefCell,
         VerifierConv as EdabitsConvVerifier,
@@ -30,7 +30,7 @@ use serde::Serialize;
 use serde_json;
 use std::{
     string::ToString,
-    sync::Arc,
+    sync::{Arc, Barrier},
     thread,
     time::{Duration, Instant},
 };
@@ -92,6 +92,13 @@ enum BenchmarkCommand {
         common_opts: CommonOptions,
         #[clap(flatten)]
         fpm_opts: FixedPointMultOptions,
+    },
+    #[clap(name = "edabits-2pc")]
+    SymmetricEdabits {
+        #[clap(flatten)]
+        common_opts: CommonOptions,
+        #[clap(flatten)]
+        sym_opts: SymmetricEdabitsOptions,
     },
 }
 
@@ -196,6 +203,23 @@ impl BenchmarkCommand {
                     check_edabits_num_fpm(num);
                 }
             }
+            BenchmarkCommand::SymmetricEdabits {
+                common_opts,
+                sym_opts,
+            } => {
+                check_num_positive(sym_opts.num);
+                check_no_binary_field(sym_opts.field);
+                check_bitsize(sym_opts.field, sym_opts.bit_size);
+                if !matches!(common_opts.party, Party::Both) {
+                    Cli::command()
+                        .error(
+                            ErrorKind::InvalidValue,
+                            "The symmetric 2PC edabits benchmark requires --party both",
+                        )
+                        .exit();
+                }
+                check_edabits_num_conversions(sym_opts.num);
+            }
         };
     }
 
@@ -204,6 +228,7 @@ impl BenchmarkCommand {
             BenchmarkCommand::Multiplication { common_opts, .. } => common_opts,
             BenchmarkCommand::Conversion { common_opts, .. } => common_opts,
             BenchmarkCommand::FixedPointMult { common_opts, .. } => common_opts,
+            BenchmarkCommand::SymmetricEdabits { common_opts, .. } => common_opts,
         }
     }
 }
@@ -289,11 +314,28 @@ struct FixedPointMultOptions {
     fraction_size: usize,
 }
 
+/// Options for the symmetric 2PC edabits benchmark
+#[derive(Debug, Args)]
+struct SymmetricEdabitsOptions {
+    /// Which field to use for the arithmetic domain
+    #[clap(short = 'f', long, value_enum, default_value_t = FieldParameter::F61p)]
+    field: FieldParameter,
+
+    /// Number of global edabits to generate
+    #[clap(short, long)]
+    num: usize,
+
+    /// Bit-size of the generated edabits
+    #[clap(short, long)]
+    bit_size: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 enum ProtocolStats {
     Multiplication(MultiplicationStats),
     Conversion(ConversionStats),
     FixedPointMult(FixedPointMultStats),
+    SymmetricEdabits(SymmetricEdabitsStats),
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -344,6 +386,21 @@ struct FixedPointMultStats {
     num: usize,
     integer_size: usize,
     fraction_size: usize,
+    time_stats: Vec<TimeStats>,
+    comm_stats: CommStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+enum SymmetricEdabitsAggregation {
+    AveragePerPeer,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SymmetricEdabitsStats {
+    num: usize,
+    bit_size: usize,
+    peer_count: usize,
+    aggregation: SymmetricEdabitsAggregation,
     time_stats: Vec<TimeStats>,
     comm_stats: CommStats,
 }
@@ -421,6 +478,28 @@ impl BenchmarkResult {
                     }
                 }
             }
+            ProtocolStats::SymmetricEdabits(SymmetricEdabitsStats {
+                num,
+                bit_size,
+                peer_count,
+                aggregation,
+                time_stats,
+                comm_stats,
+            }) => {
+                for prot_stats in self.protocol_stats.drain(..).skip(1) {
+                    if let ProtocolStats::SymmetricEdabits(mut sym_stats) = prot_stats {
+                        assert_eq!(sym_stats.num, *num);
+                        assert_eq!(sym_stats.bit_size, *bit_size);
+                        assert_eq!(sym_stats.peer_count, *peer_count);
+                        assert_eq!(sym_stats.aggregation, *aggregation);
+                        assert_eq!(sym_stats.comm_stats, *comm_stats);
+                        assert_eq!(sym_stats.time_stats.len(), 1);
+                        time_stats.push(sym_stats.time_stats.pop().unwrap());
+                    } else {
+                        assert!(false, "mixed ProtocolStats");
+                    }
+                }
+            }
         };
         self.protocol_stats = vec![result];
     }
@@ -438,6 +517,583 @@ impl BenchmarkResult {
             protocol_stats: Default::default(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SymmetricPeerBenchmarkStats {
+    time_stats: TimeStats,
+    comm_stats: CommStats,
+}
+
+fn sum_fcom_stats(lhs: FComStats, rhs: FComStats) -> FComStats {
+    FComStats {
+        num_voles_used: lhs.num_voles_used + rhs.num_voles_used,
+        num_vole_extensions_performed: lhs.num_vole_extensions_performed
+            + rhs.num_vole_extensions_performed,
+    }
+}
+
+fn average_fcom_stats(lhs: FComStats, rhs: FComStats) -> FComStats {
+    assert_eq!(
+        lhs, rhs,
+        "symmetric peers should consume identical VOLE stats"
+    );
+    lhs
+}
+
+fn sum_time_stats(lhs: &TimeStats, rhs: &TimeStats) -> TimeStats {
+    TimeStats {
+        init_time: lhs.init_time + rhs.init_time,
+        voles_time: lhs.voles_time + rhs.voles_time,
+        commit_time: lhs.commit_time + rhs.commit_time,
+        check_time: lhs.check_time + rhs.check_time,
+    }
+}
+
+fn average_time_stats(lhs: &TimeStats, rhs: &TimeStats) -> TimeStats {
+    TimeStats {
+        init_time: (lhs.init_time + rhs.init_time) / 2,
+        voles_time: (lhs.voles_time + rhs.voles_time) / 2,
+        commit_time: (lhs.commit_time + rhs.commit_time) / 2,
+        check_time: (lhs.check_time + rhs.check_time) / 2,
+    }
+}
+
+fn sum_comm_stats(lhs: &CommStats, rhs: &CommStats) -> CommStats {
+    CommStats {
+        init_kb_sent: lhs.init_kb_sent + rhs.init_kb_sent,
+        init_kb_received: lhs.init_kb_received + rhs.init_kb_received,
+        voles_kb_sent: lhs.voles_kb_sent + rhs.voles_kb_sent,
+        voles_kb_received: lhs.voles_kb_received + rhs.voles_kb_received,
+        voles_f2_stats: sum_fcom_stats(lhs.voles_f2_stats, rhs.voles_f2_stats),
+        voles_fp_stats: sum_fcom_stats(lhs.voles_fp_stats, rhs.voles_fp_stats),
+        commit_kb_sent: lhs.commit_kb_sent + rhs.commit_kb_sent,
+        commit_kb_received: lhs.commit_kb_received + rhs.commit_kb_received,
+        commit_f2_stats: sum_fcom_stats(lhs.commit_f2_stats, rhs.commit_f2_stats),
+        commit_fp_stats: sum_fcom_stats(lhs.commit_fp_stats, rhs.commit_fp_stats),
+        check_kb_sent: lhs.check_kb_sent + rhs.check_kb_sent,
+        check_kb_received: lhs.check_kb_received + rhs.check_kb_received,
+        check_f2_stats: sum_fcom_stats(lhs.check_f2_stats, rhs.check_f2_stats),
+        check_fp_stats: sum_fcom_stats(lhs.check_fp_stats, rhs.check_fp_stats),
+    }
+}
+
+fn average_comm_stats(lhs: &CommStats, rhs: &CommStats) -> CommStats {
+    CommStats {
+        init_kb_sent: (lhs.init_kb_sent + rhs.init_kb_sent) / 2.0,
+        init_kb_received: (lhs.init_kb_received + rhs.init_kb_received) / 2.0,
+        voles_kb_sent: (lhs.voles_kb_sent + rhs.voles_kb_sent) / 2.0,
+        voles_kb_received: (lhs.voles_kb_received + rhs.voles_kb_received) / 2.0,
+        voles_f2_stats: average_fcom_stats(lhs.voles_f2_stats, rhs.voles_f2_stats),
+        voles_fp_stats: average_fcom_stats(lhs.voles_fp_stats, rhs.voles_fp_stats),
+        commit_kb_sent: (lhs.commit_kb_sent + rhs.commit_kb_sent) / 2.0,
+        commit_kb_received: (lhs.commit_kb_received + rhs.commit_kb_received) / 2.0,
+        commit_f2_stats: average_fcom_stats(lhs.commit_f2_stats, rhs.commit_f2_stats),
+        commit_fp_stats: average_fcom_stats(lhs.commit_fp_stats, rhs.commit_fp_stats),
+        check_kb_sent: (lhs.check_kb_sent + rhs.check_kb_sent) / 2.0,
+        check_kb_received: (lhs.check_kb_received + rhs.check_kb_received) / 2.0,
+        check_f2_stats: average_fcom_stats(lhs.check_f2_stats, rhs.check_f2_stats),
+        check_fp_stats: average_fcom_stats(lhs.check_fp_stats, rhs.check_fp_stats),
+    }
+}
+
+fn estimate_edabits_benchmark_voles_prover<FE: FiniteField<PrimeField = FE>>(
+    num: usize,
+    bit_size: usize,
+) -> (usize, usize) {
+    let (mut num_voles_2, mut num_voles_p) =
+        EdabitsConvProver::<FE>::estimate_voles(num, bit_size as u32);
+    num_voles_2 += num * bit_size;
+    num_voles_p += num;
+    (num_voles_2, num_voles_p)
+}
+
+fn estimate_edabits_benchmark_voles_verifier<FE: FiniteField<PrimeField = FE>>(
+    num: usize,
+    bit_size: usize,
+) -> (usize, usize) {
+    let (mut num_voles_2, mut num_voles_p) =
+        EdabitsConvVerifier::<FE>::estimate_voles(num, bit_size as u32);
+    num_voles_2 += num * bit_size;
+    num_voles_p += num;
+    (num_voles_2, num_voles_p)
+}
+
+trait SymmetricEdabitsSession<FE: FiniteField<PrimeField = FE>>: Sized {
+    fn init<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        channel: &mut C,
+        rng: &mut RNG,
+        sym_opts: &SymmetricEdabitsOptions,
+    ) -> Self;
+
+    fn reserve_voles<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+    );
+
+    fn commit<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        sym_opts: &SymmetricEdabitsOptions,
+    );
+
+    fn check<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+    );
+
+    fn take_fcom_stats(&mut self) -> (FComStats, FComStats);
+
+    fn expected_voles(&self) -> (usize, usize);
+}
+
+struct SymmetricEdabitsProverSession<FE: FiniteField> {
+    f2_prover: RcRefCell<FComProver<F40b>>,
+    fp_prover: RcRefCell<FComProver<FE>>,
+    conv_prover: EdabitsConvProver<FE>,
+    conversion_tuples: Option<Vec<diet_mac_and_cheese::conv::EdabitsProver<FE>>>,
+    num_voles_2: usize,
+    num_voles_p: usize,
+}
+
+impl<FE: FiniteField<PrimeField = FE>> SymmetricEdabitsSession<FE>
+    for SymmetricEdabitsProverSession<FE>
+{
+    fn init<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        channel: &mut C,
+        rng: &mut RNG,
+        sym_opts: &SymmetricEdabitsOptions,
+    ) -> Self {
+        let (num_voles_2, num_voles_p) =
+            estimate_edabits_benchmark_voles_prover::<FE>(sym_opts.num, sym_opts.bit_size);
+        let (lpn_setup_params_2, lpn_extend_params_2) = choose_lpn_parameters::<F40b>(num_voles_p);
+        let (lpn_setup_params_p, lpn_extend_params_p) = choose_lpn_parameters::<FE>(num_voles_p);
+
+        let f2_prover = RcRefCell::new(
+            FComProver::<F40b>::init(channel, rng, lpn_setup_params_2, lpn_extend_params_2)
+                .expect("FComProver::init failed"),
+        );
+        let fp_prover = RcRefCell::new(
+            FComProver::<FE>::init(channel, rng, lpn_setup_params_p, lpn_extend_params_p)
+                .expect("FComProver::init failed"),
+        );
+        let conv_prover = EdabitsConvProver::<FE>::from_homcoms(&f2_prover, &fp_prover)
+            .expect("from_homcoms failed");
+
+        Self {
+            f2_prover,
+            fp_prover,
+            conv_prover,
+            conversion_tuples: None,
+            num_voles_2,
+            num_voles_p,
+        }
+    }
+
+    fn reserve_voles<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+    ) {
+        self.f2_prover
+            .get_refmut()
+            .voles_reserve(channel, rng, self.num_voles_2)
+            .expect("voles_reserve failed");
+        self.fp_prover
+            .get_refmut()
+            .voles_reserve(channel, rng, self.num_voles_p)
+            .expect("voles_reserve failed");
+        channel.flush().expect("flush failed");
+    }
+
+    fn commit<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        sym_opts: &SymmetricEdabitsOptions,
+    ) {
+        self.conversion_tuples = Some(
+            random_edabits_prover(
+                &mut self.f2_prover.get_refmut(),
+                &mut self.fp_prover.get_refmut(),
+                channel,
+                rng,
+                sym_opts.bit_size,
+                sym_opts.num,
+            )
+            .expect("random_edabits_prover failed"),
+        );
+        channel.flush().expect("flush failed");
+    }
+
+    fn check<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+    ) {
+        self.conv_prover
+            .verify_conversions(
+                channel,
+                rng,
+                self.conversion_tuples
+                    .as_ref()
+                    .expect("conversion tuples should be committed before checking"),
+            )
+            .expect("verify_conversions failed");
+    }
+
+    fn take_fcom_stats(&mut self) -> (FComStats, FComStats) {
+        let fp_stats = self.fp_prover.get_refmut().get_stats();
+        self.fp_prover.get_refmut().clear_stats();
+        let f2_stats = self.f2_prover.get_refmut().get_stats();
+        self.f2_prover.get_refmut().clear_stats();
+        (f2_stats, fp_stats)
+    }
+
+    fn expected_voles(&self) -> (usize, usize) {
+        (self.num_voles_2, self.num_voles_p)
+    }
+}
+
+struct SymmetricEdabitsVerifierSession<FE: FiniteField> {
+    f2_verifier: RcRefCell<FComVerifier<F40b>>,
+    fp_verifier: RcRefCell<FComVerifier<FE>>,
+    conv_verifier: EdabitsConvVerifier<FE>,
+    conversion_tuples: Option<Vec<diet_mac_and_cheese::conv::EdabitsVerifier<FE>>>,
+    num_voles_2: usize,
+    num_voles_p: usize,
+}
+
+impl<FE: FiniteField<PrimeField = FE>> SymmetricEdabitsSession<FE>
+    for SymmetricEdabitsVerifierSession<FE>
+{
+    fn init<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        channel: &mut C,
+        rng: &mut RNG,
+        sym_opts: &SymmetricEdabitsOptions,
+    ) -> Self {
+        let (num_voles_2, num_voles_p) =
+            estimate_edabits_benchmark_voles_verifier::<FE>(sym_opts.num, sym_opts.bit_size);
+        let (lpn_setup_params_2, lpn_extend_params_2) = choose_lpn_parameters::<F40b>(num_voles_p);
+        let (lpn_setup_params_p, lpn_extend_params_p) = choose_lpn_parameters::<FE>(num_voles_p);
+
+        let f2_verifier = RcRefCell::new(
+            FComVerifier::<F40b>::init(channel, rng, lpn_setup_params_2, lpn_extend_params_2)
+                .expect("FComVerifier::init failed"),
+        );
+        let fp_verifier = RcRefCell::new(
+            FComVerifier::<FE>::init(channel, rng, lpn_setup_params_p, lpn_extend_params_p)
+                .expect("FComVerifier::init failed"),
+        );
+        let conv_verifier = EdabitsConvVerifier::<FE>::from_homcoms(&f2_verifier, &fp_verifier)
+            .expect("from_homcoms failed");
+
+        Self {
+            f2_verifier,
+            fp_verifier,
+            conv_verifier,
+            conversion_tuples: None,
+            num_voles_2,
+            num_voles_p,
+        }
+    }
+
+    fn reserve_voles<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+    ) {
+        self.f2_verifier
+            .get_refmut()
+            .voles_reserve(channel, rng, self.num_voles_2)
+            .expect("voles_reserve failed");
+        self.fp_verifier
+            .get_refmut()
+            .voles_reserve(channel, rng, self.num_voles_p)
+            .expect("voles_reserve failed");
+        channel.flush().expect("flush failed");
+    }
+
+    fn commit<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        sym_opts: &SymmetricEdabitsOptions,
+    ) {
+        self.conversion_tuples = Some(
+            random_edabits_verifier(
+                &mut self.f2_verifier.get_refmut(),
+                &mut self.fp_verifier.get_refmut(),
+                channel,
+                rng,
+                sym_opts.bit_size,
+                sym_opts.num,
+            )
+            .expect("random_edabits_verifier failed"),
+        );
+        channel.flush().expect("flush failed");
+    }
+
+    fn check<C: AbstractChannel, RNG: rand::CryptoRng + rand::Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+    ) {
+        self.conv_verifier
+            .verify_conversions(
+                channel,
+                rng,
+                self.conversion_tuples
+                    .as_ref()
+                    .expect("conversion tuples should be committed before checking"),
+            )
+            .expect("verify_conversions failed");
+    }
+
+    fn take_fcom_stats(&mut self) -> (FComStats, FComStats) {
+        let fp_stats = self.fp_verifier.get_refmut().get_stats();
+        self.fp_verifier.get_refmut().clear_stats();
+        let f2_stats = self.f2_verifier.get_refmut().get_stats();
+        self.f2_verifier.get_refmut().clear_stats();
+        (f2_stats, fp_stats)
+    }
+
+    fn expected_voles(&self) -> (usize, usize) {
+        (self.num_voles_2, self.num_voles_p)
+    }
+}
+
+fn symmetric_phase_comm_stats<C1: AbstractChannel, C2: AbstractChannel>(
+    primary_channel: &TrackChannel<C1>,
+    secondary_channel: &TrackChannel<C2>,
+) -> (f64, f64) {
+    (
+        primary_channel.kilobytes_written() + secondary_channel.kilobytes_written(),
+        primary_channel.kilobytes_read() + secondary_channel.kilobytes_read(),
+    )
+}
+
+fn finalize_symmetric_phase<C1: AbstractChannel, C2: AbstractChannel>(
+    primary_channel: &mut TrackChannel<C1>,
+    secondary_channel: &mut TrackChannel<C2>,
+    barrier: &Barrier,
+) {
+    primary_channel.clear();
+    secondary_channel.clear();
+    barrier.wait();
+}
+
+fn run_symmetric_edabits_peer<
+    FE: FiniteField<PrimeField = FE>,
+    PrimarySession: SymmetricEdabitsSession<FE>,
+    SecondarySession: SymmetricEdabitsSession<FE>,
+    C1: AbstractChannel,
+    C2: AbstractChannel,
+>(
+    primary_channel: &mut TrackChannel<C1>,
+    secondary_channel: &mut TrackChannel<C2>,
+    sym_opts: &SymmetricEdabitsOptions,
+    barrier: &Barrier,
+) -> SymmetricPeerBenchmarkStats {
+    let mut stats = SymmetricPeerBenchmarkStats::default();
+    let mut rng = AesRng::from_seed(Default::default());
+    primary_channel.clear();
+    secondary_channel.clear();
+
+    let t_start = Instant::now();
+    let mut primary = PrimarySession::init(primary_channel, &mut rng, sym_opts);
+    let mut secondary = SecondarySession::init(secondary_channel, &mut rng, sym_opts);
+    stats.time_stats.init_time = t_start.elapsed();
+    let (init_kb_sent, init_kb_received) =
+        symmetric_phase_comm_stats(primary_channel, secondary_channel);
+    stats.comm_stats.init_kb_sent = init_kb_sent;
+    stats.comm_stats.init_kb_received = init_kb_received;
+    finalize_symmetric_phase(primary_channel, secondary_channel, barrier);
+
+    let expected_voles_primary = primary.expected_voles();
+    let expected_voles_secondary = secondary.expected_voles();
+
+    let t_start = Instant::now();
+    primary.reserve_voles(primary_channel, &mut rng);
+    secondary.reserve_voles(secondary_channel, &mut rng);
+    stats.time_stats.voles_time = t_start.elapsed();
+    let (voles_kb_sent, voles_kb_received) =
+        symmetric_phase_comm_stats(primary_channel, secondary_channel);
+    stats.comm_stats.voles_kb_sent = voles_kb_sent;
+    stats.comm_stats.voles_kb_received = voles_kb_received;
+    let (primary_f2_stats, primary_fp_stats) = primary.take_fcom_stats();
+    let (secondary_f2_stats, secondary_fp_stats) = secondary.take_fcom_stats();
+    stats.comm_stats.voles_f2_stats = sum_fcom_stats(primary_f2_stats, secondary_f2_stats);
+    stats.comm_stats.voles_fp_stats = sum_fcom_stats(primary_fp_stats, secondary_fp_stats);
+    finalize_symmetric_phase(primary_channel, secondary_channel, barrier);
+
+    let t_start = Instant::now();
+    primary.commit(primary_channel, &mut rng, sym_opts);
+    secondary.commit(secondary_channel, &mut rng, sym_opts);
+    stats.time_stats.commit_time = t_start.elapsed();
+    let (commit_kb_sent, commit_kb_received) =
+        symmetric_phase_comm_stats(primary_channel, secondary_channel);
+    stats.comm_stats.commit_kb_sent = commit_kb_sent;
+    stats.comm_stats.commit_kb_received = commit_kb_received;
+    let (primary_f2_stats, primary_fp_stats) = primary.take_fcom_stats();
+    let (secondary_f2_stats, secondary_fp_stats) = secondary.take_fcom_stats();
+    stats.comm_stats.commit_f2_stats = sum_fcom_stats(primary_f2_stats, secondary_f2_stats);
+    stats.comm_stats.commit_fp_stats = sum_fcom_stats(primary_fp_stats, secondary_fp_stats);
+    assert_eq!(
+        stats
+            .comm_stats
+            .commit_fp_stats
+            .num_vole_extensions_performed,
+        0
+    );
+    assert_eq!(
+        stats
+            .comm_stats
+            .commit_f2_stats
+            .num_vole_extensions_performed,
+        0
+    );
+    finalize_symmetric_phase(primary_channel, secondary_channel, barrier);
+
+    let t_start = Instant::now();
+    primary.check(primary_channel, &mut rng);
+    secondary.check(secondary_channel, &mut rng);
+    stats.time_stats.check_time = t_start.elapsed();
+    let (check_kb_sent, check_kb_received) =
+        symmetric_phase_comm_stats(primary_channel, secondary_channel);
+    stats.comm_stats.check_kb_sent = check_kb_sent;
+    stats.comm_stats.check_kb_received = check_kb_received;
+    let (primary_f2_stats, primary_fp_stats) = primary.take_fcom_stats();
+    let (secondary_f2_stats, secondary_fp_stats) = secondary.take_fcom_stats();
+    stats.comm_stats.check_f2_stats = sum_fcom_stats(primary_f2_stats, secondary_f2_stats);
+    stats.comm_stats.check_fp_stats = sum_fcom_stats(primary_fp_stats, secondary_fp_stats);
+    assert_eq!(
+        stats
+            .comm_stats
+            .check_fp_stats
+            .num_vole_extensions_performed,
+        0
+    );
+    assert_eq!(
+        stats
+            .comm_stats
+            .check_f2_stats
+            .num_vole_extensions_performed,
+        0
+    );
+    finalize_symmetric_phase(primary_channel, secondary_channel, barrier);
+
+    assert_eq!(
+        stats.comm_stats.commit_fp_stats.num_voles_used
+            + stats.comm_stats.check_fp_stats.num_voles_used,
+        expected_voles_primary.1 + expected_voles_secondary.1,
+    );
+    assert_eq!(
+        stats.comm_stats.commit_f2_stats.num_voles_used
+            + stats.comm_stats.check_f2_stats.num_voles_used,
+        expected_voles_primary.0 + expected_voles_secondary.0,
+    );
+
+    stats
+}
+
+fn aggregate_symmetric_edabits_peers(
+    sym_opts: &SymmetricEdabitsOptions,
+    lhs: &SymmetricPeerBenchmarkStats,
+    rhs: &SymmetricPeerBenchmarkStats,
+) -> SymmetricEdabitsStats {
+    let combined_lhs = SymmetricPeerBenchmarkStats {
+        time_stats: sum_time_stats(&lhs.time_stats, &TimeStats::default()),
+        comm_stats: sum_comm_stats(&lhs.comm_stats, &CommStats::default()),
+    };
+    let combined_rhs = SymmetricPeerBenchmarkStats {
+        time_stats: sum_time_stats(&rhs.time_stats, &TimeStats::default()),
+        comm_stats: sum_comm_stats(&rhs.comm_stats, &CommStats::default()),
+    };
+
+    SymmetricEdabitsStats {
+        num: sym_opts.num,
+        bit_size: sym_opts.bit_size,
+        peer_count: 2,
+        aggregation: SymmetricEdabitsAggregation::AveragePerPeer,
+        time_stats: vec![average_time_stats(
+            &combined_lhs.time_stats,
+            &combined_rhs.time_stats,
+        )],
+        comm_stats: average_comm_stats(&combined_lhs.comm_stats, &combined_rhs.comm_stats),
+    }
+}
+
+fn run_symmetric_edabits_benchmark<FE: FiniteField<PrimeField = FE>>(
+    common_opts: &CommonOptions,
+    sym_opts: &SymmetricEdabitsOptions,
+) -> Vec<ProtocolStats> {
+    let (mut primary_peer0, mut primary_peer1) = track_unix_channel_pair();
+    let (mut secondary_peer0, mut secondary_peer1) = track_unix_channel_pair();
+    let barrier = Arc::new(Barrier::new(2));
+    let repetitions = common_opts.repetitions;
+    let peer0_barrier = barrier.clone();
+    let peer0_opts = SymmetricEdabitsOptions {
+        field: sym_opts.field,
+        num: sym_opts.num,
+        bit_size: sym_opts.bit_size,
+    };
+    let peer0 = thread::spawn(move || {
+        let mut stats = Vec::with_capacity(repetitions);
+        for _ in 0..repetitions {
+            stats.push(run_symmetric_edabits_peer::<
+                FE,
+                SymmetricEdabitsProverSession<FE>,
+                SymmetricEdabitsVerifierSession<FE>,
+                _,
+                _,
+            >(
+                &mut primary_peer0,
+                &mut secondary_peer0,
+                &peer0_opts,
+                peer0_barrier.as_ref(),
+            ));
+        }
+        stats
+    });
+
+    let peer1_barrier = barrier.clone();
+    let peer1_opts = SymmetricEdabitsOptions {
+        field: sym_opts.field,
+        num: sym_opts.num,
+        bit_size: sym_opts.bit_size,
+    };
+    let peer1 = thread::spawn(move || {
+        let mut stats = Vec::with_capacity(repetitions);
+        for _ in 0..repetitions {
+            stats.push(run_symmetric_edabits_peer::<
+                FE,
+                SymmetricEdabitsVerifierSession<FE>,
+                SymmetricEdabitsProverSession<FE>,
+                _,
+                _,
+            >(
+                &mut primary_peer1,
+                &mut secondary_peer1,
+                &peer1_opts,
+                peer1_barrier.as_ref(),
+            ));
+        }
+        stats
+    });
+
+    let peer0_stats = peer0.join().unwrap();
+    let peer1_stats = peer1.join().unwrap();
+    peer0_stats
+        .iter()
+        .zip(peer1_stats.iter())
+        .map(|(lhs, rhs)| {
+            ProtocolStats::SymmetricEdabits(aggregate_symmetric_edabits_peers(sym_opts, lhs, rhs))
+        })
+        .collect()
 }
 
 fn run_mult_prover<FE: FiniteField, C: AbstractChannel>(

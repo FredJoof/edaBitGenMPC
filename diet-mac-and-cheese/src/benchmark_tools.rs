@@ -4,12 +4,12 @@ use git_version::git_version;
 use scuttlebutt::{SyncChannel, TrackChannel};
 use serde::Serialize;
 use std::{
-    fmt,
+    env, fmt,
     fs::{read_to_string, File},
     io::{BufRead, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
     process, thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -48,6 +48,24 @@ pub fn run_command_with_args(cmd: &str, args: &[&str]) -> String {
     .to_string()
 }
 
+pub fn try_run_command_with_args(cmd: &str, args: &[&str]) -> Option<String> {
+    let output = process::Command::new(cmd).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let stdout = stdout.trim();
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout.to_string())
+    }
+}
+
+pub fn try_run_command(cmd: &str) -> Option<String> {
+    try_run_command_with_args(cmd, &[])
+}
+
 pub fn run_command(cmd: &str) -> String {
     String::from_utf8(
         process::Command::new(cmd)
@@ -65,31 +83,53 @@ pub fn read_file(path: &str) -> String {
 }
 
 pub fn get_username() -> String {
-    run_command("whoami")
+    env::var("USER")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| env::var("USERNAME").ok().filter(|value| !value.is_empty()))
+        .or_else(|| try_run_command("whoami"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub fn get_hostname() -> String {
-    read_file("/proc/sys/kernel/hostname").trim().to_string()
+    read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|hostname| hostname.trim().to_string())
+        .filter(|hostname| !hostname.is_empty())
+        .or_else(|| env::var("HOSTNAME").ok().filter(|value| !value.is_empty()))
+        .or_else(|| try_run_command("hostname"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub fn get_timestamp() -> String {
-    run_command_with_args("date", &["--iso-8601=s"])
+    try_run_command_with_args("date", &["--iso-8601=s"])
+        .or_else(|| try_run_command_with_args("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]))
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs().to_string())
+                .unwrap_or_else(|_| "0".to_string())
+        })
 }
 
 pub fn get_cmdline() -> Vec<String> {
-    let f = File::open("/proc/self/cmdline").expect("cannot open file");
-    let mut reader = BufReader::new(f);
-    let mut cmdline: Vec<String> = Vec::new();
-    loop {
-        let mut bytes = Vec::<u8>::new();
-        let num_bytes = reader.read_until(0, &mut bytes).expect("read failed");
-        if num_bytes == 0 {
-            break;
+    if let Ok(f) = File::open("/proc/self/cmdline") {
+        let mut reader = BufReader::new(f);
+        let mut cmdline: Vec<String> = Vec::new();
+        loop {
+            let mut bytes = Vec::<u8>::new();
+            let num_bytes = reader.read_until(0, &mut bytes).expect("read failed");
+            if num_bytes == 0 {
+                break;
+            }
+            bytes.pop();
+            cmdline.push(String::from_utf8(bytes).expect("utf-8 decoding failed"))
         }
-        bytes.pop();
-        cmdline.push(String::from_utf8(bytes).expect("utf-8 decoding failed"))
+        if !cmdline.is_empty() {
+            return cmdline;
+        }
     }
-    cmdline
+    env::args().collect()
 }
 
 pub fn get_pid() -> u32 {

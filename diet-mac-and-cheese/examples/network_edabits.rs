@@ -271,11 +271,13 @@ fn main() -> std::io::Result<()> {
         .arg(
             Arg::new("multithreaded")
                 .long("multithreaded")
-                .help("Using multithreading on B-loop"),
+                .help("Using multithreading on B-loop")
+                .required(false)
+                .action(ArgAction::SetTrue),
         )
         .get_matches();
     let whoami;
-    if !matches.contains_id("prover") {
+    if !matches.get_flag("prover") {
         whoami = VERIFIER;
     } else {
         whoami = PROVER;
@@ -288,7 +290,7 @@ fn main() -> std::io::Result<()> {
     let num_edabits = usize::from_str_radix(matches.get_one::<String>("num_edabits").unwrap(), 10)
         .unwrap_or(usize::from_str_radix(DEFAULT_NUM_EDABITS, 10).unwrap());
 
-    let multithreaded = matches.contains_id("multithreaded");
+    let multithreaded = matches.get_flag("multithreaded");
     let num_cut = num_bucket;
     run(
         whoami,
