@@ -56,16 +56,16 @@ fn copy_edabits_verifier<FE: FiniteField>(edabits: &EdabitsVerifier<FE>) -> Edab
 }
 
 #[derive(Clone)]
-struct DabitProver<FE: FiniteField> {
-    bit: MacProver<F40b>,
-    value: MacProver<FE>,
+pub(crate) struct DabitProver<FE: FiniteField> {
+    pub(crate) bit: MacProver<F40b>,
+    pub(crate) value: MacProver<FE>,
 }
 
 /// DabitVerifier struct
 #[derive(Clone)]
-struct DabitVerifier<FE: FiniteField> {
-    bit: MacVerifier<F40b>,
-    value: MacVerifier<FE>,
+pub(crate) struct DabitVerifier<FE: FiniteField> {
+    pub(crate) bit: MacVerifier<F40b>,
+    pub(crate) value: MacVerifier<FE>,
 }
 
 const FDABIT_SECURITY_PARAMETER: usize = 38;
@@ -537,7 +537,7 @@ impl<FE: FiniteField<PrimeField = FE>> ProverConv<FE> {
         Ok(edabits_vec)
     }
 
-    fn random_dabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+    pub(crate) fn random_dabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
         rng: &mut RNG,
@@ -597,7 +597,7 @@ impl<FE: FiniteField<PrimeField = FE>> ProverConv<FE> {
         Ok(())
     }
 
-    fn fdabit<C: AbstractChannel, RNG: CryptoRng + Rng>(
+    pub(crate) fn fdabit<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
         rng: &mut RNG,
@@ -1412,7 +1412,7 @@ impl<FE: FiniteField<PrimeField = FE>> VerifierConv<FE> {
         Ok(edabits_vec_mac)
     }
 
-    fn random_dabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+    pub(crate) fn random_dabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
         rng: &mut RNG,
@@ -1460,7 +1460,7 @@ impl<FE: FiniteField<PrimeField = FE>> VerifierConv<FE> {
         Ok(())
     }
 
-    fn fdabit<C: AbstractChannel, RNG: CryptoRng + Rng>(
+    pub(crate) fn fdabit<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
         rng: &mut RNG,

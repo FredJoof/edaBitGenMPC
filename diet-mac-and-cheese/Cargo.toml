@@ -31,7 +31,6 @@ scuttlebutt.workspace = true
 smallvec.workspace = true
 subtle.workspace = true
 ocelot.workspace = true
-fancy-garbling.workspace = true
 zki_sieve.workspace = true
 flatbuffers.workspace = true
 nix.workspace = true
