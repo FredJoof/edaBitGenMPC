@@ -711,6 +711,7 @@ dependencies = [
  "criterion",
  "crypto-bigint",
  "eyre",
+ "fancy-garbling",
  "flatbuffers 23.1.21",
  "generic-array",
  "git-version",
