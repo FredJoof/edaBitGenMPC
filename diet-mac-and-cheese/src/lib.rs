@@ -31,6 +31,7 @@ pub(crate) mod memory;
 pub mod mpc_conv;
 pub mod mpc_edabits;
 pub mod mpc_homcom;
+pub mod mpc_original_edabits;
 #[allow(clippy::all)]
 pub mod read_sieveir_phase2;
 mod sieveir_phase2;
