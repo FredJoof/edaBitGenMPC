@@ -1,28 +1,24 @@
 #![allow(clippy::too_many_arguments)]
 
-//! Peer-oriented 2PC implementation of the original edaBits paper flow.
+//! Peer-oriented 2PC implementation of the original edaBits paper flow using
+//! a SPDZ-style authenticated-share backend instead of VOLE/FCom.
 //!
 //! Correspondence with the repository:
-//! - [`crate::mpc_homcom`] provides the peer-facing VOLE/tag backend.
-//! - [`crate::mpc_conv`] provides the authenticated-share `private_edabits` and
-//!   `global_edabits` types.
-//! - This module mirrors the original paper's private-edaBit cut-and-choose:
-//!   private edaBits and private triples are sampled and shared, a random cut
-//!   set is opened, and the remaining buckets are checked with faulty triples.
-//!
-//! The final combine still follows the paper's Figure 3 structure:
-//! - add the private bit contributions with a ripple-carry adder over
-//!   authenticated secret-shared bits
-//! - convert the overflow carry bits into authenticated field shares
-//! - subtract `2^m` times the carry contribution from the summed arithmetic
-//!   shares
+//! - [`crate::mpc_original_edabits`] keeps the same protocol shape with the
+//!   VOLE/tag backend.
+//! - [`crate::mpc_spdz_common`] provides the SPDZ-style authenticated-share
+//!   machinery used here.
+//! - Bucket consistency still uses the original paper's faulty triples.
 
-use crate::edabits::{ProverConv, VerifierConv};
-use crate::mpc_conv::{AuthenticatedShare, GlobalEdabit, PrivateEdabit, SharedEdabit};
-use crate::mpc_edabits_common::{
-    convert_bits_to_field, flatten_bits, split_bits, MpcEdabitsCommon, SharedBitTriple,
+use crate::mpc_edabits_common::{convert_bits_to_field, split_bits};
+use crate::mpc_homcom::PeerRole;
+use crate::mpc_original_edabits::select_cut_and_choose_parameters;
+use crate::mpc_spdz_common::{
+    MpcSpdzCommon, SpdzFieldBackend, SpdzOtExt, SpdzSharedBitTriple,
 };
-use crate::mpc_homcom::{PeerFieldMacs, PeerRole};
+use crate::mpc_spdz_conv::{
+    SpdzGlobalEdabit, SpdzPrivateEdabit, SpdzSharedEdabit,
+};
 use eyre::{eyre, Result};
 use ocelot::svole::wykw::LpnParams;
 use rand::{CryptoRng, Rng, SeedableRng};
@@ -32,15 +28,10 @@ use scuttlebutt::{
     AbstractChannel, AesRng, Block,
 };
 
-pub fn select_cut_and_choose_parameters(num_edabits: usize) -> (usize, usize) {
-    crate::mpc_edabits_common::select_cut_and_choose_parameters(num_edabits)
-}
-
 fn generate_permutation<T, RNG: CryptoRng + Rng>(rng: &mut RNG, v: &mut [T]) {
     if v.is_empty() {
         return;
     }
-
     let mut i = v.len() - 1;
     while i > 0 {
         let idx = rng.gen_range(0..i);
@@ -54,15 +45,15 @@ struct PrivateBitTriple {
     clear_a: F2,
     clear_b: F2,
     clear_c: F2,
-    shared: SharedBitTriple,
+    shared: SpdzSharedBitTriple,
 }
 
 struct LocalPrivateEdabitBatch<FE: FiniteField> {
-    private_edabits: Vec<PrivateEdabit<FE>>,
+    private_edabits: Vec<SpdzPrivateEdabit<FE>>,
 }
 
 struct RemotePrivateEdabitBatch<FE: FiniteField> {
-    peer_private_edabits: Vec<SharedEdabit<FE>>,
+    peer_private_edabits: Vec<SpdzSharedEdabit<FE>>,
 }
 
 struct LocalPrivateTripleBatch {
@@ -70,78 +61,90 @@ struct LocalPrivateTripleBatch {
 }
 
 struct RemotePrivateTripleBatch {
-    peer_private_triples: Vec<SharedBitTriple>,
+    peer_private_triples: Vec<SpdzSharedBitTriple>,
 }
 
 struct RawPrivateEdabitState<FE: FiniteField> {
-    private_edabits: Vec<PrivateEdabit<FE>>,
-    peer_private_edabits: Vec<SharedEdabit<FE>>,
+    private_edabits: Vec<SpdzPrivateEdabit<FE>>,
+    peer_private_edabits: Vec<SpdzSharedEdabit<FE>>,
     private_triples: Vec<PrivateBitTriple>,
-    peer_private_triples: Vec<SharedBitTriple>,
+    peer_private_triples: Vec<SpdzSharedBitTriple>,
 }
 
 struct VerifiedPrivateEdabitState<FE: FiniteField> {
-    private_edabits: Vec<PrivateEdabit<FE>>,
-    peer_private_edabits: Vec<SharedEdabit<FE>>,
+    private_edabits: Vec<SpdzPrivateEdabit<FE>>,
+    peer_private_edabits: Vec<SpdzSharedEdabit<FE>>,
 }
 
-pub struct MpcOriginalEdabitsPeer<FE: FiniteField> {
+pub struct MpcOriginalEdabitsSpdzPeer<FE: FiniteField> {
     role: PeerRole,
-    pub fcom_f2: PeerFieldMacs<F40b>,
-    pub fcom_fe: PeerFieldMacs<FE>,
-    local_conv: ProverConv<FE>,
-    remote_conv: VerifierConv<FE>,
+    f2_backend: SpdzFieldBackend<F40b>,
+    fe_backend: SpdzFieldBackend<FE>,
+    ot: SpdzOtExt,
 }
 
-impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsCommon<FE> for MpcOriginalEdabitsPeer<FE> {
+impl<FE: FiniteField<PrimeField = FE>> MpcSpdzCommon<FE> for MpcOriginalEdabitsSpdzPeer<FE> {
     fn role(&self) -> PeerRole {
         self.role
     }
 
-    fn fcom_f2(&self) -> &PeerFieldMacs<F40b> {
-        &self.fcom_f2
+    fn spdz_f2(&self) -> &SpdzFieldBackend<F40b> {
+        &self.f2_backend
     }
 
-    fn fcom_f2_mut(&mut self) -> &mut PeerFieldMacs<F40b> {
-        &mut self.fcom_f2
+    fn spdz_f2_mut(&mut self) -> &mut SpdzFieldBackend<F40b> {
+        &mut self.f2_backend
     }
 
-    fn fcom_fe(&self) -> &PeerFieldMacs<FE> {
-        &self.fcom_fe
+    fn spdz_fe(&self) -> &SpdzFieldBackend<FE> {
+        &self.fe_backend
     }
 
-    fn fcom_fe_mut(&mut self) -> &mut PeerFieldMacs<FE> {
-        &mut self.fcom_fe
+    fn spdz_fe_mut(&mut self) -> &mut SpdzFieldBackend<FE> {
+        &mut self.fe_backend
     }
 
-    fn local_conv_mut(&mut self) -> &mut ProverConv<FE> {
-        &mut self.local_conv
-    }
-
-    fn remote_conv_mut(&mut self) -> &mut VerifierConv<FE> {
-        &mut self.remote_conv
+    fn ot_mut(&mut self) -> &mut SpdzOtExt {
+        &mut self.ot
     }
 }
 
-impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
+impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsSpdzPeer<FE> {
     pub fn init<C: AbstractChannel, RNG: CryptoRng + Rng>(
         channel: &mut C,
         rng: &mut RNG,
         role: PeerRole,
-        lpn_setup: LpnParams,
-        lpn_extend: LpnParams,
+        _lpn_setup: LpnParams,
+        _lpn_extend: LpnParams,
     ) -> Result<Self> {
-        let fcom_f2 = PeerFieldMacs::init(channel, rng, role, lpn_setup, lpn_extend)?;
-        let fcom_fe = PeerFieldMacs::init(channel, rng, role, lpn_setup, lpn_extend)?;
-        let local_conv = ProverConv::init_zero(fcom_f2.local(), fcom_fe.local())?;
-        let remote_conv = VerifierConv::init_zero(fcom_f2.remote(), fcom_fe.remote())?;
+        let f2_backend = SpdzFieldBackend::init(channel, rng, role)?;
+        let fe_backend = SpdzFieldBackend::init(channel, rng, role)?;
+        let ot = SpdzOtExt::init(channel, rng, role)?;
         Ok(Self {
             role,
-            fcom_f2,
-            fcom_fe,
-            local_conv,
-            remote_conv,
+            f2_backend,
+            fe_backend,
+            ot,
         })
+    }
+
+    fn sample_joint_block<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+    ) -> Result<Block> {
+        let local = rng.gen::<Block>();
+        let remote = if self.role.is_first() {
+            channel.write_block(&local)?;
+            channel.flush()?;
+            channel.read_block()?
+        } else {
+            let remote = channel.read_block()?;
+            channel.write_block(&local)?;
+            channel.flush()?;
+            remote
+        };
+        Ok(local ^ remote)
     }
 
     fn sample_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
@@ -162,10 +165,9 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
             clear_bits.push(bits);
         }
 
-        let flat_bits = flatten_bits(&clear_bits);
+        let flat_bits: Vec<_> = clear_bits.iter().flat_map(|bits| bits.iter().copied()).collect();
         let shared_bits = self.share_owned_f2_values(channel, rng, &flat_bits)?;
         let shared_values = self.share_owned_fe_values(channel, rng, &clear_values)?;
-        let shared_bit_rows = split_bits(&flat_bits, bit_size);
 
         let mut private_edabits = Vec::with_capacity(num);
         let mut bit_offset = 0;
@@ -175,11 +177,10 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
                 bits.push(shared_bits[bit_offset]);
                 bit_offset += 1;
             }
-            debug_assert_eq!(shared_bit_rows[i], clear_bits[i]);
-            private_edabits.push(PrivateEdabit {
+            private_edabits.push(SpdzPrivateEdabit {
                 clear_bits: clear_bits[i].clone(),
                 clear_value: clear_values[i],
-                shared: SharedEdabit {
+                shared: SpdzSharedEdabit {
                     bits,
                     value: shared_values[i],
                 },
@@ -189,15 +190,14 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         Ok(LocalPrivateEdabitBatch { private_edabits })
     }
 
-    fn receive_peer_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+    fn receive_peer_private_edabits<C: AbstractChannel>(
         &mut self,
         channel: &mut C,
-        rng: &mut RNG,
         bit_size: usize,
         num: usize,
     ) -> Result<RemotePrivateEdabitBatch<FE>> {
-        let flat_bits = self.receive_shared_f2_values(channel, rng, num * bit_size)?;
-        let shared_values = self.receive_shared_fe_values(channel, rng, num)?;
+        let flat_bits = self.receive_shared_f2_values(channel, num * bit_size)?;
+        let shared_values = self.receive_shared_fe_values(channel, num)?;
 
         let mut peer_private_edabits = Vec::with_capacity(num);
         let mut bit_offset = 0;
@@ -207,12 +207,11 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
                 bits.push(flat_bits[bit_offset]);
                 bit_offset += 1;
             }
-            peer_private_edabits.push(SharedEdabit {
+            peer_private_edabits.push(SpdzSharedEdabit {
                 bits,
                 value: shared_values[i],
             });
         }
-
         Ok(RemotePrivateEdabitBatch {
             peer_private_edabits,
         })
@@ -246,7 +245,7 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
                 clear_a: a_values[i],
                 clear_b: b_values[i],
                 clear_c: c_values[i],
-                shared: SharedBitTriple {
+                shared: SpdzSharedBitTriple {
                     a: shared_a[i],
                     b: shared_b[i],
                     c: shared_c[i],
@@ -257,19 +256,18 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         Ok(LocalPrivateTripleBatch { private_triples })
     }
 
-    fn receive_peer_private_triples<C: AbstractChannel, RNG: CryptoRng + Rng>(
+    fn receive_peer_private_triples<C: AbstractChannel>(
         &mut self,
         channel: &mut C,
-        rng: &mut RNG,
         num: usize,
     ) -> Result<RemotePrivateTripleBatch> {
-        let shared_a = self.receive_shared_f2_values(channel, rng, num)?;
-        let shared_b = self.receive_shared_f2_values(channel, rng, num)?;
-        let shared_c = self.receive_shared_f2_values(channel, rng, num)?;
+        let shared_a = self.receive_shared_f2_values(channel, num)?;
+        let shared_b = self.receive_shared_f2_values(channel, num)?;
+        let shared_c = self.receive_shared_f2_values(channel, num)?;
 
         let mut peer_private_triples = Vec::with_capacity(num);
         for i in 0..num {
-            peer_private_triples.push(SharedBitTriple {
+            peer_private_triples.push(SpdzSharedBitTriple {
                 a: shared_a[i],
                 b: shared_b[i],
                 c: shared_c[i],
@@ -293,15 +291,15 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         {
             (
                 self.sample_private_edabits(channel, rng, bit_size, num_edabits)?,
-                self.receive_peer_private_edabits(channel, rng, bit_size, num_edabits)?,
+                self.receive_peer_private_edabits(channel, bit_size, num_edabits)?,
                 self.sample_private_triples(channel, rng, num_triples)?,
-                self.receive_peer_private_triples(channel, rng, num_triples)?,
+                self.receive_peer_private_triples(channel, num_triples)?,
             )
         } else {
             let remote_edabits =
-                self.receive_peer_private_edabits(channel, rng, bit_size, num_edabits)?;
+                self.receive_peer_private_edabits(channel, bit_size, num_edabits)?;
             let local_edabits = self.sample_private_edabits(channel, rng, bit_size, num_edabits)?;
-            let remote_triples = self.receive_peer_private_triples(channel, rng, num_triples)?;
+            let remote_triples = self.receive_peer_private_triples(channel, num_triples)?;
             let local_triples = self.sample_private_triples(channel, rng, num_triples)?;
             (local_edabits, remote_edabits, local_triples, remote_triples)
         };
@@ -314,29 +312,11 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         })
     }
 
-    fn sample_joint_block<C: AbstractChannel, RNG: CryptoRng + Rng>(
+    fn open_and_check_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
         rng: &mut RNG,
-    ) -> Result<Block> {
-        let local = rng.gen::<Block>();
-        let remote = if self.role.is_first() {
-            channel.write_block(&local)?;
-            channel.flush()?;
-            channel.read_block()?
-        } else {
-            let remote = channel.read_block()?;
-            channel.write_block(&local)?;
-            channel.flush()?;
-            remote
-        };
-        Ok(local ^ remote)
-    }
-
-    fn open_and_check_edabits<C: AbstractChannel>(
-        &mut self,
-        channel: &mut C,
-        edabits: &[SharedEdabit<FE>],
+        edabits: &[SpdzSharedEdabit<FE>],
     ) -> Result<()> {
         if edabits.is_empty() {
             return Ok(());
@@ -348,8 +328,8 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
             .flat_map(|edabit| edabit.bits.iter().copied())
             .collect();
         let values: Vec<_> = edabits.iter().map(|edabit| edabit.value).collect();
-        let opened_bits = self.open_shared_bit_batch(channel, &flat_bits)?;
-        let opened_values = self.open_shared_field_batch(channel, &values)?;
+        let opened_bits = self.open_shared_bit_batch(channel, rng, &flat_bits)?;
+        let opened_values = self.open_shared_field_batch(channel, rng, &values)?;
         for (bits, value) in split_bits(&opened_bits, bit_size)
             .into_iter()
             .zip(opened_values)
@@ -361,10 +341,11 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         Ok(())
     }
 
-    fn open_and_check_triples<C: AbstractChannel>(
+    fn open_and_check_triples<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
-        triples: &[SharedBitTriple],
+        rng: &mut RNG,
+        triples: &[SpdzSharedBitTriple],
     ) -> Result<()> {
         if triples.is_empty() {
             return Ok(());
@@ -373,9 +354,9 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         let a_batch: Vec<_> = triples.iter().map(|triple| triple.a).collect();
         let b_batch: Vec<_> = triples.iter().map(|triple| triple.b).collect();
         let c_batch: Vec<_> = triples.iter().map(|triple| triple.c).collect();
-        let opened_a = self.open_shared_bit_batch(channel, &a_batch)?;
-        let opened_b = self.open_shared_bit_batch(channel, &b_batch)?;
-        let opened_c = self.open_shared_bit_batch(channel, &c_batch)?;
+        let opened_a = self.open_shared_bit_batch(channel, rng, &a_batch)?;
+        let opened_b = self.open_shared_bit_batch(channel, rng, &b_batch)?;
+        let opened_c = self.open_shared_bit_batch(channel, rng, &c_batch)?;
         for ((a, b), c) in opened_a
             .into_iter()
             .zip(opened_b.into_iter())
@@ -392,8 +373,8 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         &mut self,
         channel: &mut C,
         rng: &mut RNG,
-        edabit_buckets: &[Vec<SharedEdabit<FE>>],
-        triple_buckets: &[Vec<SharedBitTriple>],
+        edabit_buckets: &[Vec<SpdzSharedEdabit<FE>>],
+        triple_buckets: &[Vec<SpdzSharedBitTriple>],
     ) -> Result<()> {
         if edabit_buckets.is_empty() {
             return Ok(());
@@ -414,25 +395,14 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
                 let other = edabit_buckets[bucket_idx][pair_idx].clone();
                 lhs.push(anchor.clone());
                 rhs.push(other.clone());
-                arithmetic_sums.push(AuthenticatedShare::new(
-                    self.fcom_fe
-                        .local()
-                        .get_refmut()
-                        .add(anchor.value.local, other.value.local),
-                    self.fcom_fe
-                        .remote()
-                        .get_refmut()
-                        .add(anchor.value.remote, other.value.remote),
-                ));
+                arithmetic_sums.push(self.add_field_shares(anchor.value, other.value));
             }
             triples.extend_from_slice(&triple_buckets[bucket_idx]);
         }
 
         let (sum_bits, carry_bits) =
-            self.add_private_bit_contributions(channel, &lhs, &rhs, &triples)?;
-        let carry_dabits = self.generate_checked_shared_dabits(channel, rng, num_pairs)?;
-        let carry_field_shares =
-            self.convert_shared_bits_to_field(channel, &carry_bits, &carry_dabits)?;
+            self.add_private_bit_contributions_with_triples(channel, rng, &lhs, &rhs, &triples)?;
+        let carry_field_shares = self.convert_shared_bits_to_field(channel, rng, &carry_bits)?;
         let corrected_values =
             self.apply_overflow_correction(&arithmetic_sums, &carry_field_shares, bit_size);
 
@@ -440,8 +410,8 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
             .iter()
             .flat_map(|bits| bits.iter().copied())
             .collect();
-        let opened_bits = self.open_shared_bit_batch(channel, &flat_bits)?;
-        let opened_values = self.open_shared_field_batch(channel, &corrected_values)?;
+        let opened_bits = self.open_shared_bit_batch(channel, rng, &flat_bits)?;
+        let opened_values = self.open_shared_field_batch(channel, rng, &corrected_values)?;
         for (bits, value) in split_bits(&opened_bits, bit_size)
             .into_iter()
             .zip(opened_values)
@@ -461,9 +431,9 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         bit_size: usize,
         num_bucket: usize,
         num_cut: usize,
-        private_edabits: &[PrivateEdabit<FE>],
+        private_edabits: &[SpdzPrivateEdabit<FE>],
         private_triples: &[PrivateBitTriple],
-    ) -> Result<Vec<PrivateEdabit<FE>>> {
+    ) -> Result<Vec<SpdzPrivateEdabit<FE>>> {
         let mut shuffled_private_edabits = private_edabits.to_vec();
         let mut shuffled_shared_edabits: Vec<_> = shuffled_private_edabits
             .iter()
@@ -486,8 +456,8 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         generate_permutation(&mut triple_rng_private, &mut shuffled_private_triples);
         generate_permutation(&mut triple_rng_shared, &mut shuffled_shared_triples);
 
-        self.open_and_check_edabits(channel, &shuffled_shared_edabits[..num_cut])?;
-        self.open_and_check_triples(channel, &shuffled_shared_triples[..num_cut * bit_size])?;
+        self.open_and_check_edabits(channel, rng, &shuffled_shared_edabits[..num_cut])?;
+        self.open_and_check_triples(channel, rng, &shuffled_shared_triples[..num_cut * bit_size])?;
 
         for triple in &shuffled_private_triples[..num_cut * bit_size] {
             if triple.clear_a * triple.clear_b != triple.clear_c {
@@ -521,9 +491,9 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         bit_size: usize,
         num_bucket: usize,
         num_cut: usize,
-        peer_private_edabits: &[SharedEdabit<FE>],
-        peer_private_triples: &[SharedBitTriple],
-    ) -> Result<Vec<SharedEdabit<FE>>> {
+        peer_private_edabits: &[SpdzSharedEdabit<FE>],
+        peer_private_triples: &[SpdzSharedBitTriple],
+    ) -> Result<Vec<SpdzSharedEdabit<FE>>> {
         let mut shuffled_peer_edabits = peer_private_edabits.to_vec();
         let mut shuffled_peer_triples = peer_private_triples.to_vec();
 
@@ -532,8 +502,8 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         generate_permutation(&mut edabit_rng, &mut shuffled_peer_edabits);
         generate_permutation(&mut triple_rng, &mut shuffled_peer_triples);
 
-        self.open_and_check_edabits(channel, &shuffled_peer_edabits[..num_cut])?;
-        self.open_and_check_triples(channel, &shuffled_peer_triples[..num_cut * bit_size])?;
+        self.open_and_check_edabits(channel, rng, &shuffled_peer_edabits[..num_cut])?;
+        self.open_and_check_triples(channel, rng, &shuffled_peer_triples[..num_cut * bit_size])?;
 
         let output_num = (shuffled_peer_edabits.len() - num_cut) / num_bucket;
         let mut edabit_buckets = Vec::with_capacity(output_num);
@@ -616,8 +586,8 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         channel: &mut C,
         rng: &mut RNG,
         state: &VerifiedPrivateEdabitState<FE>,
-    ) -> Result<Vec<GlobalEdabit<FE>>> {
-        MpcEdabitsCommon::combine_private_into_global_edabits(
+    ) -> Result<Vec<SpdzGlobalEdabit<FE>>> {
+        MpcSpdzCommon::combine_private_into_global_edabits(
             self,
             channel,
             rng,
@@ -634,7 +604,7 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         num: usize,
         num_bucket: usize,
         num_cut: usize,
-    ) -> Result<Vec<GlobalEdabit<FE>>> {
+    ) -> Result<Vec<SpdzGlobalEdabit<FE>>> {
         let num_random_edabits = num * num_bucket + num_cut;
         let num_random_triples = num * (num_bucket - 1) * bit_size + num_cut * bit_size;
         let raw = self.sample_and_share_private_material(
@@ -654,7 +624,7 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         rng: &mut RNG,
         bit_size: usize,
         num: usize,
-    ) -> Result<Vec<GlobalEdabit<FE>>> {
+    ) -> Result<Vec<SpdzGlobalEdabit<FE>>> {
         let (num_bucket, num_cut) = select_cut_and_choose_parameters(num);
         self.generate_global_edabits_with_parameters(
             channel, rng, bit_size, num, num_bucket, num_cut,
@@ -667,16 +637,17 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         rng: &mut RNG,
         bit_size: usize,
         num: usize,
-    ) -> Result<Vec<GlobalEdabit<FE>>> {
+    ) -> Result<Vec<SpdzGlobalEdabit<FE>>> {
         self.generate_global_edabits(channel, rng, bit_size, num)
     }
 
-    pub fn open_global_edabits<C: AbstractChannel>(
+    pub fn open_global_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
-        global_edabits: &[GlobalEdabit<FE>],
+        rng: &mut RNG,
+        global_edabits: &[SpdzGlobalEdabit<FE>],
     ) -> Result<Vec<(Vec<F2>, FE)>> {
-        MpcEdabitsCommon::open_global_edabits(self, channel, global_edabits)
+        MpcSpdzCommon::open_global_edabits(self, channel, rng, global_edabits)
     }
 }
 
@@ -684,22 +655,125 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
 mod tests {
     use super::*;
     use ocelot::svole::wykw::{LPN_EXTEND_SMALL, LPN_SETUP_SMALL};
-    use rand::SeedableRng;
-    use scuttlebutt::{field::F61p, AesRng, Channel};
+    use scuttlebutt::{field::F61p, Channel};
     use std::{
         io::{BufReader, BufWriter},
         os::unix::net::UnixStream,
     };
 
     #[test]
-    fn test_mpc_original_global_edabits_roundtrip() {
+    fn test_mpc_spdz_field_share_roundtrip() {
         let (left, right) = UnixStream::pair().unwrap();
         let handle = std::thread::spawn(move || {
             let mut rng = AesRng::from_seed(Default::default());
             let reader = BufReader::new(left.try_clone().unwrap());
             let writer = BufWriter::new(left);
             let mut channel = Channel::new(reader, writer);
-            let mut peer = MpcOriginalEdabitsPeer::<F61p>::init(
+            let mut peer = MpcOriginalEdabitsSpdzPeer::<F61p>::init(
+                &mut channel,
+                &mut rng,
+                PeerRole::First,
+                LPN_SETUP_SMALL,
+                LPN_EXTEND_SMALL,
+            )
+            .unwrap();
+            let values = [F61p::ONE, F61p::try_from(7u128).unwrap()];
+            let shares = peer.share_owned_fe_values(&mut channel, &mut rng, &values).unwrap();
+            let opened = peer.open_shared_field_batch(&mut channel, &mut rng, &shares).unwrap();
+            assert_eq!(opened, values);
+        });
+
+        let mut rng = AesRng::from_seed(Default::default());
+        let reader = BufReader::new(right.try_clone().unwrap());
+        let writer = BufWriter::new(right);
+        let mut channel = Channel::new(reader, writer);
+        let mut peer = MpcOriginalEdabitsSpdzPeer::<F61p>::init(
+            &mut channel,
+            &mut rng,
+            PeerRole::Second,
+            LPN_SETUP_SMALL,
+            LPN_EXTEND_SMALL,
+        )
+        .unwrap();
+        let shares = peer.receive_shared_fe_values(&mut channel, 2).unwrap();
+        let opened = peer
+            .open_shared_field_batch(&mut channel, &mut rng, &shares)
+            .unwrap();
+        assert_eq!(opened, [F61p::ONE, F61p::try_from(7u128).unwrap()]);
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_mpc_spdz_bit_to_field_roundtrip() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut rng = AesRng::from_seed(Default::default());
+            let reader = BufReader::new(left.try_clone().unwrap());
+            let writer = BufWriter::new(left);
+            let mut channel = Channel::new(reader, writer);
+            let mut peer = MpcOriginalEdabitsSpdzPeer::<F61p>::init(
+                &mut channel,
+                &mut rng,
+                PeerRole::First,
+                LPN_SETUP_SMALL,
+                LPN_EXTEND_SMALL,
+            )
+            .unwrap();
+            let bits = [F2::ZERO, F2::ONE, F2::ONE, F2::ZERO];
+            let shared_bits = peer.share_owned_f2_values(&mut channel, &mut rng, &bits).unwrap();
+            let field_bits = peer
+                .convert_shared_bits_to_field(&mut channel, &mut rng, &shared_bits)
+                .unwrap();
+            let opened_bits = peer
+                .open_shared_bit_batch(&mut channel, &mut rng, &shared_bits)
+                .unwrap();
+            let opened_fields = peer
+                .open_shared_field_batch(&mut channel, &mut rng, &field_bits)
+                .unwrap();
+            for (bit, field) in opened_bits.into_iter().zip(opened_fields) {
+                assert_eq!(if bit == F2::ONE { F61p::ONE } else { F61p::ZERO }, field);
+            }
+        });
+
+        let mut rng = AesRng::from_seed(Default::default());
+        let reader = BufReader::new(right.try_clone().unwrap());
+        let writer = BufWriter::new(right);
+        let mut channel = Channel::new(reader, writer);
+        let mut peer = MpcOriginalEdabitsSpdzPeer::<F61p>::init(
+            &mut channel,
+            &mut rng,
+            PeerRole::Second,
+            LPN_SETUP_SMALL,
+            LPN_EXTEND_SMALL,
+        )
+        .unwrap();
+        let shared_bits = peer.receive_shared_f2_values(&mut channel, 4).unwrap();
+        let field_bits = peer
+            .convert_shared_bits_to_field(&mut channel, &mut rng, &shared_bits)
+            .unwrap();
+        let opened_bits = peer
+            .open_shared_bit_batch(&mut channel, &mut rng, &shared_bits)
+            .unwrap();
+        let opened_fields = peer
+            .open_shared_field_batch(&mut channel, &mut rng, &field_bits)
+            .unwrap();
+        for (bit, field) in opened_bits.into_iter().zip(opened_fields) {
+            assert_eq!(if bit == F2::ONE { F61p::ONE } else { F61p::ZERO }, field);
+        }
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_mpc_original_spdz_global_edabits_roundtrip() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut rng = AesRng::from_seed(Default::default());
+            let reader = BufReader::new(left.try_clone().unwrap());
+            let writer = BufWriter::new(left);
+            let mut channel = Channel::new(reader, writer);
+            let mut peer = MpcOriginalEdabitsSpdzPeer::<F61p>::init(
                 &mut channel,
                 &mut rng,
                 PeerRole::First,
@@ -713,7 +787,7 @@ mod tests {
             assert_eq!(global_edabits.len(), 64);
 
             let opened = peer
-                .open_global_edabits(&mut channel, &global_edabits)
+                .open_global_edabits(&mut channel, &mut rng, &global_edabits)
                 .unwrap();
             for (bits, value) in opened {
                 assert_eq!(bits.len(), 8);
@@ -725,7 +799,7 @@ mod tests {
         let reader = BufReader::new(right.try_clone().unwrap());
         let writer = BufWriter::new(right);
         let mut channel = Channel::new(reader, writer);
-        let mut peer = MpcOriginalEdabitsPeer::<F61p>::init(
+        let mut peer = MpcOriginalEdabitsSpdzPeer::<F61p>::init(
             &mut channel,
             &mut rng,
             PeerRole::Second,
@@ -739,7 +813,7 @@ mod tests {
         assert_eq!(global_edabits.len(), 64);
 
         let opened = peer
-            .open_global_edabits(&mut channel, &global_edabits)
+            .open_global_edabits(&mut channel, &mut rng, &global_edabits)
             .unwrap();
         for (bits, value) in opened {
             assert_eq!(bits.len(), 8);

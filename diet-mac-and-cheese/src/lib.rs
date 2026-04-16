@@ -33,6 +33,9 @@ pub mod mpc_edabits;
 mod mpc_edabits_common;
 pub mod mpc_homcom;
 pub mod mpc_original_edabits;
+pub mod mpc_original_edabits_spdz;
+pub mod mpc_spdz_conv;
+mod mpc_spdz_common;
 #[allow(clippy::all)]
 pub mod read_sieveir_phase2;
 mod sieveir_phase2;
