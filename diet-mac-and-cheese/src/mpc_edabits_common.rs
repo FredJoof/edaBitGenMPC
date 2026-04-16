@@ -131,6 +131,13 @@ pub(crate) trait MpcEdabitsCommon<FE: FiniteField<PrimeField = FE>> {
         )
     }
 
+    fn zero_field_share(&self) -> AuthenticatedShare<FE> {
+        AuthenticatedShare::new(
+            MacProver::new(FE::PrimeField::ZERO, FE::ZERO),
+            MacVerifier::new(FE::ZERO),
+        )
+    }
+
     fn add_bit_shares(
         &mut self,
         lhs: AuthenticatedShare<F40b>,

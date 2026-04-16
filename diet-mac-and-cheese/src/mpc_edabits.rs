@@ -48,6 +48,12 @@ struct RemotePrivateEdabitBatch<FE: FiniteField> {
     peer_private_proof_edabits: Vec<crate::conv::EdabitsVerifier<FE>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateInputSharingPolicy {
+    RandomAdditive,
+    OwnerZero,
+}
+
 pub fn select_cut_and_choose_parameters(num_edabits: usize) -> (usize, usize) {
     crate::mpc_edabits_common::select_cut_and_choose_parameters(num_edabits)
 }
@@ -113,41 +119,47 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
         })
     }
 
-    fn sample_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+    fn share_private_clear_edabits_with_policy<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
         rng: &mut RNG,
-        bit_size: usize,
-        num: usize,
-    ) -> Result<LocalPrivateEdabitBatch<FE>> {
-        let proof_edabits = self
-            .local_conv
-            .random_edabits(channel, rng, bit_size, num)?;
-
-        let mut clear_bits = Vec::with_capacity(num);
-        let mut clear_values = Vec::with_capacity(num);
+        clear_bits: &[Vec<F2>],
+        clear_values: &[FE],
+        policy: PrivateInputSharingPolicy,
+    ) -> Result<Vec<PrivateEdabit<FE>>> {
+        let num = clear_bits.len();
+        let bit_size = clear_bits.first().map_or(0, Vec::len);
+        debug_assert_eq!(num, clear_values.len());
         let mut local_bit_shares = Vec::with_capacity(num);
         let mut remote_bit_shares = Vec::with_capacity(num);
         let mut local_value_shares = Vec::with_capacity(num);
         let mut remote_value_shares = Vec::with_capacity(num);
 
-        for proof in &proof_edabits {
-            let proof_bits: Vec<F2> = proof.bits.iter().map(|bit| bit.value()).collect();
-            let proof_value = proof.value.value();
+        for (proof_bits, proof_value) in clear_bits.iter().zip(clear_values.iter().copied()) {
+            let (local_bits, remote_bits) = match policy {
+                PrivateInputSharingPolicy::RandomAdditive => {
+                    let mut local_bits = Vec::with_capacity(bit_size);
+                    let mut remote_bits = Vec::with_capacity(bit_size);
+                    for bit in proof_bits {
+                        let local_bit = F2::random(rng);
+                        local_bits.push(local_bit);
+                        remote_bits.push(*bit + local_bit);
+                    }
+                    (local_bits, remote_bits)
+                }
+                PrivateInputSharingPolicy::OwnerZero => {
+                    (proof_bits.clone(), vec![F2::ZERO; bit_size])
+                }
+            };
 
-            let mut local_bits = Vec::with_capacity(bit_size);
-            let mut remote_bits = Vec::with_capacity(bit_size);
-            for bit in &proof_bits {
-                let local_bit = F2::random(rng);
-                local_bits.push(local_bit);
-                remote_bits.push(*bit + local_bit);
-            }
+            let (local_value, remote_value) = match policy {
+                PrivateInputSharingPolicy::RandomAdditive => {
+                    let local_value = FE::random(rng);
+                    (local_value, proof_value - local_value)
+                }
+                PrivateInputSharingPolicy::OwnerZero => (proof_value, FE::ZERO),
+            };
 
-            let local_value = FE::random(rng);
-            let remote_value = proof_value - local_value;
-
-            clear_bits.push(proof_bits);
-            clear_values.push(proof_value);
             local_bit_shares.push(local_bits);
             remote_bit_shares.push(remote_bits);
             local_value_shares.push(local_value);
@@ -166,20 +178,32 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
                 .get_refmut()
                 .input(channel, rng, &local_value_shares)?;
 
-        channel.write_serializable_seq::<F2>(&flatten_bits(&remote_bit_shares))?;
-        channel.write_serializable_seq::<FE>(&remote_value_shares)?;
-        channel.flush()?;
+        let (remote_bit_auth, remote_value_auth) = match policy {
+            PrivateInputSharingPolicy::RandomAdditive => {
+                channel.write_serializable_seq::<F2>(&flatten_bits(&remote_bit_shares))?;
+                channel.write_serializable_seq::<FE>(&remote_value_shares)?;
+                channel.flush()?;
 
-        let remote_bit_auth =
-            self.fcom_f2
-                .remote()
-                .get_refmut()
-                .input(channel, rng, flat_local_bits.len())?;
-        let remote_value_auth = self
-            .fcom_fe
-            .remote()
-            .get_refmut()
-            .input(channel, rng, num)?;
+                let remote_bit_auth = self.fcom_f2.remote().get_refmut().input(
+                    channel,
+                    rng,
+                    flat_local_bits.len(),
+                )?;
+                let remote_value_auth = self
+                    .fcom_fe
+                    .remote()
+                    .get_refmut()
+                    .input(channel, rng, num)?;
+                (remote_bit_auth, remote_value_auth)
+            }
+            PrivateInputSharingPolicy::OwnerZero => {
+                channel.flush()?;
+                (
+                    vec![self.zero_bit_share().remote; flat_local_bits.len()],
+                    vec![self.zero_field_share().remote; num],
+                )
+            }
+        };
 
         let mut private_edabits = Vec::with_capacity(num);
         let mut bit_mac_offset = 0;
@@ -210,23 +234,85 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
             });
         }
 
+        Ok(private_edabits)
+    }
+
+    fn sample_private_edabits_with_policy<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+        policy: PrivateInputSharingPolicy,
+    ) -> Result<LocalPrivateEdabitBatch<FE>> {
+        let proof_edabits = self
+            .local_conv
+            .random_edabits(channel, rng, bit_size, num)?;
+        let clear_bits: Vec<_> = proof_edabits
+            .iter()
+            .map(|proof| proof.bits.iter().map(|bit| bit.value()).collect())
+            .collect();
+        let clear_values: Vec<_> = proof_edabits
+            .iter()
+            .map(|proof| proof.value.value())
+            .collect();
+        let private_edabits = self.share_private_clear_edabits_with_policy(
+            channel,
+            rng,
+            &clear_bits,
+            &clear_values,
+            policy,
+        )?;
+
         Ok(LocalPrivateEdabitBatch {
             private_edabits,
             proof_edabits,
         })
     }
 
-    fn receive_peer_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+    fn sample_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
         rng: &mut RNG,
         bit_size: usize,
         num: usize,
-    ) -> Result<RemotePrivateEdabitBatch<FE>> {
-        let peer_private_proof_edabits = self
-            .remote_conv
-            .random_edabits(channel, rng, bit_size, num)?;
+    ) -> Result<LocalPrivateEdabitBatch<FE>> {
+        self.sample_private_edabits_with_policy(
+            channel,
+            rng,
+            bit_size,
+            num,
+            PrivateInputSharingPolicy::RandomAdditive,
+        )
+    }
 
+    fn sample_private_edabits_owner_zero<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<LocalPrivateEdabitBatch<FE>> {
+        self.sample_private_edabits_with_policy(
+            channel,
+            rng,
+            bit_size,
+            num,
+            PrivateInputSharingPolicy::OwnerZero,
+        )
+    }
+
+    fn receive_private_edabit_contributions_with_policy<
+        C: AbstractChannel,
+        RNG: CryptoRng + Rng,
+    >(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+        policy: PrivateInputSharingPolicy,
+    ) -> Result<Vec<SharedEdabit<FE>>> {
         let remote_bit_auth =
             self.fcom_f2
                 .remote()
@@ -238,19 +324,36 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
             .get_refmut()
             .input(channel, rng, num)?;
 
-        let remote_bit_shares = channel.read_serializable_seq::<F2>(num * bit_size)?;
-        let remote_value_shares = channel.read_serializable_seq::<FE>(num)?;
+        let (remote_bit_shares, remote_value_shares, local_bit_macs, local_value_macs) =
+            match policy {
+                PrivateInputSharingPolicy::RandomAdditive => {
+                    let remote_bit_shares = channel.read_serializable_seq::<F2>(num * bit_size)?;
+                    let remote_value_shares = channel.read_serializable_seq::<FE>(num)?;
 
-        let local_bit_macs =
-            self.fcom_f2
-                .local()
-                .get_refmut()
-                .input(channel, rng, &remote_bit_shares)?;
-        let local_value_macs =
-            self.fcom_fe
-                .local()
-                .get_refmut()
-                .input(channel, rng, &remote_value_shares)?;
+                    let local_bit_macs = self.fcom_f2.local().get_refmut().input(
+                        channel,
+                        rng,
+                        &remote_bit_shares,
+                    )?;
+                    let local_value_macs = self.fcom_fe.local().get_refmut().input(
+                        channel,
+                        rng,
+                        &remote_value_shares,
+                    )?;
+                    (
+                        remote_bit_shares,
+                        remote_value_shares,
+                        local_bit_macs,
+                        local_value_macs,
+                    )
+                }
+                PrivateInputSharingPolicy::OwnerZero => (
+                    vec![F2::ZERO; num * bit_size],
+                    vec![FE::ZERO; num],
+                    vec![F40b::ZERO; num * bit_size],
+                    vec![FE::ZERO; num],
+                ),
+            };
 
         let remote_bit_chunks = split_bits(&remote_bit_shares, bit_size);
         let mut peer_private_edabits = Vec::with_capacity(num);
@@ -278,10 +381,60 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
             });
         }
 
+        Ok(peer_private_edabits)
+    }
+
+    fn receive_peer_private_edabits_with_policy<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+        policy: PrivateInputSharingPolicy,
+    ) -> Result<RemotePrivateEdabitBatch<FE>> {
+        let peer_private_proof_edabits = self
+            .remote_conv
+            .random_edabits(channel, rng, bit_size, num)?;
+        let peer_private_edabits = self.receive_private_edabit_contributions_with_policy(
+            channel, rng, bit_size, num, policy,
+        )?;
+
         Ok(RemotePrivateEdabitBatch {
             peer_private_edabits,
             peer_private_proof_edabits,
         })
+    }
+
+    fn receive_peer_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<RemotePrivateEdabitBatch<FE>> {
+        self.receive_peer_private_edabits_with_policy(
+            channel,
+            rng,
+            bit_size,
+            num,
+            PrivateInputSharingPolicy::RandomAdditive,
+        )
+    }
+
+    fn receive_peer_private_edabits_owner_zero<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<RemotePrivateEdabitBatch<FE>> {
+        self.receive_peer_private_edabits_with_policy(
+            channel,
+            rng,
+            bit_size,
+            num,
+            PrivateInputSharingPolicy::OwnerZero,
+        )
     }
 
     /// Sampling/input plus sharing/authentication stage for `private_edabits`.
@@ -292,14 +445,77 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
         bit_size: usize,
         num: usize,
     ) -> Result<PrivateEdabitState<FE>> {
+        self.sample_and_share_private_edabits_with_policy(
+            channel,
+            rng,
+            bit_size,
+            num,
+            PrivateInputSharingPolicy::RandomAdditive,
+        )
+    }
+
+    /// Sampling/input stage for `private_edabits` using owner/0 sharing:
+    /// the owner keeps the full authenticated share of each local contribution
+    /// and the peer receives a literal authenticated zero share.
+    pub fn sample_and_share_private_edabits_owner_zero<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<PrivateEdabitState<FE>> {
+        self.sample_and_share_private_edabits_with_policy(
+            channel,
+            rng,
+            bit_size,
+            num,
+            PrivateInputSharingPolicy::OwnerZero,
+        )
+    }
+
+    fn sample_and_share_private_edabits_with_policy<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+        policy: PrivateInputSharingPolicy,
+    ) -> Result<PrivateEdabitState<FE>> {
         let (local, remote) = if self.role.is_first() {
-            (
-                self.sample_private_edabits(channel, rng, bit_size, num)?,
-                self.receive_peer_private_edabits(channel, rng, bit_size, num)?,
-            )
+            let local = match policy {
+                PrivateInputSharingPolicy::RandomAdditive => {
+                    self.sample_private_edabits(channel, rng, bit_size, num)?
+                }
+                PrivateInputSharingPolicy::OwnerZero => {
+                    self.sample_private_edabits_owner_zero(channel, rng, bit_size, num)?
+                }
+            };
+            let remote = match policy {
+                PrivateInputSharingPolicy::RandomAdditive => {
+                    self.receive_peer_private_edabits(channel, rng, bit_size, num)?
+                }
+                PrivateInputSharingPolicy::OwnerZero => {
+                    self.receive_peer_private_edabits_owner_zero(channel, rng, bit_size, num)?
+                }
+            };
+            (local, remote)
         } else {
-            let remote = self.receive_peer_private_edabits(channel, rng, bit_size, num)?;
-            let local = self.sample_private_edabits(channel, rng, bit_size, num)?;
+            let remote = match policy {
+                PrivateInputSharingPolicy::RandomAdditive => {
+                    self.receive_peer_private_edabits(channel, rng, bit_size, num)?
+                }
+                PrivateInputSharingPolicy::OwnerZero => {
+                    self.receive_peer_private_edabits_owner_zero(channel, rng, bit_size, num)?
+                }
+            };
+            let local = match policy {
+                PrivateInputSharingPolicy::RandomAdditive => {
+                    self.sample_private_edabits(channel, rng, bit_size, num)?
+                }
+                PrivateInputSharingPolicy::OwnerZero => {
+                    self.sample_private_edabits_owner_zero(channel, rng, bit_size, num)?
+                }
+            };
             (local, remote)
         };
 
@@ -387,8 +603,44 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
         bit_size: usize,
         num: usize,
     ) -> Result<Vec<GlobalEdabit<FE>>> {
+        self.generate_global_edabits_with_policy(
+            channel,
+            rng,
+            bit_size,
+            num,
+            PrivateInputSharingPolicy::RandomAdditive,
+        )
+    }
+
+    /// Full MPC flow using owner/0 input sharing for the private contribution
+    /// layer before the existing global-combine step.
+    pub fn generate_global_edabits_owner_zero<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<Vec<GlobalEdabit<FE>>> {
+        self.generate_global_edabits_with_policy(
+            channel,
+            rng,
+            bit_size,
+            num,
+            PrivateInputSharingPolicy::OwnerZero,
+        )
+    }
+
+    fn generate_global_edabits_with_policy<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+        policy: PrivateInputSharingPolicy,
+    ) -> Result<Vec<GlobalEdabit<FE>>> {
         let (num_bucket, num_cut) = select_cut_and_choose_parameters(num);
-        let state = self.sample_and_share_private_edabits(channel, rng, bit_size, num)?;
+        let state =
+            self.sample_and_share_private_edabits_with_policy(channel, rng, bit_size, num, policy)?;
         self.cut_and_choose_private(channel, rng, num_bucket, num_cut, &state)?;
         self.combine_private_into_global_edabits(channel, rng, &state)
     }
@@ -402,6 +654,18 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
         num: usize,
     ) -> Result<Vec<GlobalEdabit<FE>>> {
         self.generate_global_edabits(channel, rng, bit_size, num)
+    }
+
+    /// Backwards-compatible alias for the owner/0 private-input-sharing
+    /// variant.
+    pub fn generate_edabits_owner_zero<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<Vec<GlobalEdabit<FE>>> {
+        self.generate_global_edabits_owner_zero(channel, rng, bit_size, num)
     }
 
     /// Open the final shared `global_edabits`.
@@ -432,12 +696,262 @@ mod tests {
     use crate::mpc_edabits_common::convert_bits_to_field;
     use ocelot::svole::wykw::{LPN_EXTEND_SMALL, LPN_SETUP_SMALL};
     use rand::SeedableRng;
-    use scuttlebutt::{field::F61p, AesRng, Channel};
+    use scuttlebutt::{
+        field::{F40b, F61p},
+        AesRng, Channel,
+    };
     use std::{
         io::{BufReader, BufWriter},
         os::unix::net::UnixStream,
     };
 
+    fn run_opened_global_edabits_with_policy(
+        policy: PrivateInputSharingPolicy,
+        bit_size: usize,
+        num: usize,
+        full_generate: bool,
+    ) -> Vec<(Vec<F2>, F61p)> {
+        let (left, right) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut rng = AesRng::from_seed(Default::default());
+            let reader = BufReader::new(left.try_clone().unwrap());
+            let writer = BufWriter::new(left);
+            let mut channel = Channel::new(reader, writer);
+            let mut peer = MpcEdabitsPeer::<F61p>::init(
+                &mut channel,
+                &mut rng,
+                PeerRole::First,
+                LPN_SETUP_SMALL,
+                LPN_EXTEND_SMALL,
+            )
+            .unwrap();
+            let global_edabits = if full_generate {
+                match policy {
+                    PrivateInputSharingPolicy::RandomAdditive => peer
+                        .generate_global_edabits(&mut channel, &mut rng, bit_size, num)
+                        .unwrap(),
+                    PrivateInputSharingPolicy::OwnerZero => peer
+                        .generate_global_edabits_owner_zero(&mut channel, &mut rng, bit_size, num)
+                        .unwrap(),
+                }
+            } else {
+                let state = match policy {
+                    PrivateInputSharingPolicy::RandomAdditive => peer
+                        .sample_and_share_private_edabits(&mut channel, &mut rng, bit_size, num)
+                        .unwrap(),
+                    PrivateInputSharingPolicy::OwnerZero => peer
+                        .sample_and_share_private_edabits_owner_zero(
+                            &mut channel,
+                            &mut rng,
+                            bit_size,
+                            num,
+                        )
+                        .unwrap(),
+                };
+                peer.combine_private_into_global_edabits(&mut channel, &mut rng, &state)
+                    .unwrap()
+            };
+
+            peer.open_global_edabits(&mut channel, &global_edabits)
+                .unwrap()
+        });
+
+        let mut rng = AesRng::from_seed(Default::default());
+        let reader = BufReader::new(right.try_clone().unwrap());
+        let writer = BufWriter::new(right);
+        let mut channel = Channel::new(reader, writer);
+        let mut peer = MpcEdabitsPeer::<F61p>::init(
+            &mut channel,
+            &mut rng,
+            PeerRole::Second,
+            LPN_SETUP_SMALL,
+            LPN_EXTEND_SMALL,
+        )
+        .unwrap();
+        let global_edabits = if full_generate {
+            match policy {
+                PrivateInputSharingPolicy::RandomAdditive => peer
+                    .generate_global_edabits(&mut channel, &mut rng, bit_size, num)
+                    .unwrap(),
+                PrivateInputSharingPolicy::OwnerZero => peer
+                    .generate_global_edabits_owner_zero(&mut channel, &mut rng, bit_size, num)
+                    .unwrap(),
+            }
+        } else {
+            let state = match policy {
+                PrivateInputSharingPolicy::RandomAdditive => peer
+                    .sample_and_share_private_edabits(&mut channel, &mut rng, bit_size, num)
+                    .unwrap(),
+                PrivateInputSharingPolicy::OwnerZero => peer
+                    .sample_and_share_private_edabits_owner_zero(
+                        &mut channel,
+                        &mut rng,
+                        bit_size,
+                        num,
+                    )
+                    .unwrap(),
+            };
+            peer.combine_private_into_global_edabits(&mut channel, &mut rng, &state)
+                .unwrap()
+        };
+
+        let opened = peer
+            .open_global_edabits(&mut channel, &global_edabits)
+            .unwrap();
+        let peer_opened = handle.join().unwrap();
+        assert_eq!(opened, peer_opened);
+        opened
+    }
+
+    fn fixed_clear_edabits(
+        role_offset: usize,
+        bit_size: usize,
+        num: usize,
+    ) -> (Vec<Vec<F2>>, Vec<F61p>) {
+        let mut clear_bits = Vec::with_capacity(num);
+        let mut clear_values = Vec::with_capacity(num);
+        for i in 0..num {
+            let bits: Vec<_> = (0..bit_size)
+                .map(|j| {
+                    if ((i * 13 + j * 7 + role_offset) % 2) == 0 {
+                        F2::ZERO
+                    } else {
+                        F2::ONE
+                    }
+                })
+                .collect();
+            clear_values.push(convert_bits_to_field::<F61p>(&bits));
+            clear_bits.push(bits);
+        }
+        (clear_bits, clear_values)
+    }
+
+    fn run_opened_combined_edabits_for_fixed_inputs(
+        policy: PrivateInputSharingPolicy,
+        bit_size: usize,
+        num: usize,
+    ) -> Vec<(Vec<F2>, F61p)> {
+        let (left, right) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut rng = AesRng::from_seed(Default::default());
+            let reader = BufReader::new(left.try_clone().unwrap());
+            let writer = BufWriter::new(left);
+            let mut channel = Channel::new(reader, writer);
+            let mut peer = MpcEdabitsPeer::<F61p>::init(
+                &mut channel,
+                &mut rng,
+                PeerRole::First,
+                LPN_SETUP_SMALL,
+                LPN_EXTEND_SMALL,
+            )
+            .unwrap();
+            let (clear_bits, clear_values) = fixed_clear_edabits(0, bit_size, num);
+            let private_edabits = peer
+                .share_private_clear_edabits_with_policy(
+                    &mut channel,
+                    &mut rng,
+                    &clear_bits,
+                    &clear_values,
+                    policy,
+                )
+                .unwrap();
+            let peer_private_edabits = peer
+                .receive_private_edabit_contributions_with_policy(
+                    &mut channel,
+                    &mut rng,
+                    bit_size,
+                    num,
+                    policy,
+                )
+                .unwrap();
+            let state = PrivateEdabitState {
+                private_edabits,
+                peer_private_edabits,
+                private_proof_edabits: Vec::new(),
+                peer_private_proof_edabits: Vec::new(),
+            };
+            let global_edabits = peer
+                .combine_private_into_global_edabits(&mut channel, &mut rng, &state)
+                .unwrap();
+            peer.open_global_edabits(&mut channel, &global_edabits)
+                .unwrap()
+        });
+
+        let mut rng = AesRng::from_seed(Default::default());
+        let reader = BufReader::new(right.try_clone().unwrap());
+        let writer = BufWriter::new(right);
+        let mut channel = Channel::new(reader, writer);
+        let mut peer = MpcEdabitsPeer::<F61p>::init(
+            &mut channel,
+            &mut rng,
+            PeerRole::Second,
+            LPN_SETUP_SMALL,
+            LPN_EXTEND_SMALL,
+        )
+        .unwrap();
+        let (clear_bits, clear_values) = fixed_clear_edabits(1, bit_size, num);
+        let peer_private_edabits = peer
+            .receive_private_edabit_contributions_with_policy(
+                &mut channel,
+                &mut rng,
+                bit_size,
+                num,
+                policy,
+            )
+            .unwrap();
+        let private_edabits = peer
+            .share_private_clear_edabits_with_policy(
+                &mut channel,
+                &mut rng,
+                &clear_bits,
+                &clear_values,
+                policy,
+            )
+            .unwrap();
+        let state = PrivateEdabitState {
+            private_edabits,
+            peer_private_edabits,
+            private_proof_edabits: Vec::new(),
+            peer_private_proof_edabits: Vec::new(),
+        };
+        let global_edabits = peer
+            .combine_private_into_global_edabits(&mut channel, &mut rng, &state)
+            .unwrap();
+        let opened = peer
+            .open_global_edabits(&mut channel, &global_edabits)
+            .unwrap();
+        let peer_opened = handle.join().unwrap();
+        assert_eq!(opened, peer_opened);
+        opened
+    }
+
+    // Checks the owner/0 sharing invariant before the combine step:
+    // the owner side keeps the full clear contribution and the peer side is
+    // represented with literal authenticated zero shares.
+    fn assert_owner_zero_state(state: &PrivateEdabitState<F61p>) {
+        for private in &state.private_edabits {
+            for (clear_bit, shared_bit) in private.clear_bits.iter().zip(private.shared.bits.iter())
+            {
+                assert_eq!(shared_bit.local.value(), *clear_bit);
+                assert_eq!(shared_bit.remote.mac(), F40b::ZERO);
+            }
+            assert_eq!(private.shared.value.local.value(), private.clear_value);
+            assert_eq!(private.shared.value.remote.mac(), F61p::ZERO);
+        }
+
+        for peer_private in &state.peer_private_edabits {
+            for shared_bit in &peer_private.bits {
+                assert_eq!(shared_bit.local.value(), F2::ZERO);
+                assert_eq!(shared_bit.local.mac(), F40b::ZERO);
+            }
+            assert_eq!(peer_private.value.local.value(), F61p::ZERO);
+            assert_eq!(peer_private.value.local.mac(), F61p::ZERO);
+        }
+    }
+
+    // Baseline regression test for the original random-additive private-input
+    // sharing path. It generates full global edaBits, opens them, and checks
+    // that the opened bits reconstruct to the opened field value.
     #[test]
     fn test_mpc_global_edabits_roundtrip() {
         let (left, right) = UnixStream::pair().unwrap();
@@ -494,5 +1008,101 @@ mod tests {
         }
 
         handle.join().unwrap();
+    }
+
+    // End-to-end roundtrip for the new owner/0 input-sharing policy. This
+    // shows that keeping the owner's full contribution and giving the peer
+    // literal authenticated zeros still produces valid global edaBits.
+    #[test]
+    fn test_mpc_global_edabits_owner_zero_roundtrip() {
+        let opened = run_opened_global_edabits_with_policy(
+            PrivateInputSharingPolicy::OwnerZero,
+            8,
+            1024,
+            true,
+        );
+        assert_eq!(opened.len(), 1024);
+        for (bits, value) in opened {
+            assert_eq!(bits.len(), 8);
+            assert_eq!(convert_bits_to_field::<F61p>(&bits), value);
+        }
+    }
+
+    // Semantic equivalence test for the combine layer. Both sharing policies
+    // are fed the same fixed clear private contributions, and the resulting
+    // opened global edaBits must match exactly.
+    #[test]
+    fn test_mpc_owner_zero_matches_random_share_combine() {
+        let random_opened = run_opened_combined_edabits_for_fixed_inputs(
+            PrivateInputSharingPolicy::RandomAdditive,
+            8,
+            64,
+        );
+        let owner_zero_opened = run_opened_combined_edabits_for_fixed_inputs(
+            PrivateInputSharingPolicy::OwnerZero,
+            8,
+            64,
+        );
+        assert_eq!(random_opened, owner_zero_opened);
+    }
+
+    // Stress test for repeated zero-side contributions. It verifies that the
+    // owner/0 private state is populated with literal zero authenticated shares
+    // on the peer side, and that reusing those zeros across many wires still
+    // combines into valid global edaBits.
+    #[test]
+    fn test_mpc_owner_zero_private_state_uses_literal_zero_shares() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut rng = AesRng::from_seed(Default::default());
+            let reader = BufReader::new(left.try_clone().unwrap());
+            let writer = BufWriter::new(left);
+            let mut channel = Channel::new(reader, writer);
+            let mut peer = MpcEdabitsPeer::<F61p>::init(
+                &mut channel,
+                &mut rng,
+                PeerRole::First,
+                LPN_SETUP_SMALL,
+                LPN_EXTEND_SMALL,
+            )
+            .unwrap();
+            let state = peer
+                .sample_and_share_private_edabits_owner_zero(&mut channel, &mut rng, 8, 128)
+                .unwrap();
+            assert_owner_zero_state(&state);
+            let global_edabits = peer
+                .combine_private_into_global_edabits(&mut channel, &mut rng, &state)
+                .unwrap();
+            peer.open_global_edabits(&mut channel, &global_edabits)
+                .unwrap()
+        });
+
+        let mut rng = AesRng::from_seed(Default::default());
+        let reader = BufReader::new(right.try_clone().unwrap());
+        let writer = BufWriter::new(right);
+        let mut channel = Channel::new(reader, writer);
+        let mut peer = MpcEdabitsPeer::<F61p>::init(
+            &mut channel,
+            &mut rng,
+            PeerRole::Second,
+            LPN_SETUP_SMALL,
+            LPN_EXTEND_SMALL,
+        )
+        .unwrap();
+        let state = peer
+            .sample_and_share_private_edabits_owner_zero(&mut channel, &mut rng, 8, 128)
+            .unwrap();
+        assert_owner_zero_state(&state);
+        let global_edabits = peer
+            .combine_private_into_global_edabits(&mut channel, &mut rng, &state)
+            .unwrap();
+        let opened = peer
+            .open_global_edabits(&mut channel, &global_edabits)
+            .unwrap();
+        let peer_opened = handle.join().unwrap();
+        assert_eq!(opened, peer_opened);
+        for (bits, value) in opened {
+            assert_eq!(convert_bits_to_field::<F61p>(&bits), value);
+        }
     }
 }
