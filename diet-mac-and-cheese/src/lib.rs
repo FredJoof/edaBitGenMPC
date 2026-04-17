@@ -29,6 +29,7 @@ pub mod hd_quicksilver;
 pub mod homcom;
 pub(crate) mod memory;
 pub mod mpc_conv;
+pub mod mpc_chedda_edabits;
 pub mod mpc_edabits;
 mod mpc_edabits_common;
 pub mod mpc_homcom;

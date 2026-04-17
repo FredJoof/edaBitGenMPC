@@ -327,6 +327,62 @@ pub(crate) trait MpcEdabitsCommon<FE: FiniteField<PrimeField = FE>> {
             .collect())
     }
 
+    fn share_private_clear_edabits_owner_zero<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        clear_bits: &[Vec<F2>],
+        clear_values: &[FE],
+    ) -> Result<Vec<PrivateEdabit<FE>>> {
+        let num = clear_bits.len();
+        let bit_size = clear_bits.first().map_or(0, Vec::len);
+        debug_assert_eq!(num, clear_values.len());
+
+        let flat_local_bits = flatten_bits(clear_bits);
+        let local_bit_macs = self
+            .fcom_f2_mut()
+            .local()
+            .get_refmut()
+            .input(channel, rng, &flat_local_bits)?;
+        let local_value_macs = self
+            .fcom_fe_mut()
+            .local()
+            .get_refmut()
+            .input(channel, rng, clear_values)?;
+        channel.flush()?;
+
+        let remote_bit_auth = vec![self.zero_bit_share().remote; flat_local_bits.len()];
+        let remote_value_auth = vec![self.zero_field_share().remote; num];
+
+        let mut private_edabits = Vec::with_capacity(num);
+        let mut bit_mac_offset = 0;
+        for i in 0..num {
+            let mut shared_bits = Vec::with_capacity(bit_size);
+            for j in 0..bit_size {
+                let local_idx = bit_mac_offset + j;
+                shared_bits.push(AuthenticatedShare::new(
+                    MacProver::new(clear_bits[i][j], local_bit_macs[local_idx]),
+                    remote_bit_auth[local_idx],
+                ));
+            }
+            bit_mac_offset += bit_size;
+
+            private_edabits.push(PrivateEdabit {
+                clear_bits: clear_bits[i].clone(),
+                clear_value: clear_values[i],
+                shared: SharedEdabit {
+                    bits: shared_bits,
+                    value: AuthenticatedShare::new(
+                        MacProver::new(clear_values[i], local_value_macs[i]),
+                        remote_value_auth[i],
+                    ),
+                },
+            });
+        }
+
+        Ok(private_edabits)
+    }
+
     fn receive_shared_f2_values<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
@@ -414,6 +470,58 @@ pub(crate) trait MpcEdabitsCommon<FE: FiniteField<PrimeField = FE>> {
             .zip(remote_auth)
             .map(|((share, mac), auth)| AuthenticatedShare::new(MacProver::new(share, mac), auth))
             .collect())
+    }
+
+    fn receive_private_edabit_contributions_owner_zero<
+        C: AbstractChannel,
+        RNG: CryptoRng + Rng,
+    >(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<Vec<SharedEdabit<FE>>> {
+        let remote_bit_auth = self
+            .fcom_f2_mut()
+            .remote()
+            .get_refmut()
+            .input(channel, rng, num * bit_size)?;
+        let remote_value_auth = self
+            .fcom_fe_mut()
+            .remote()
+            .get_refmut()
+            .input(channel, rng, num)?;
+
+        let remote_bit_shares = vec![F2::ZERO; num * bit_size];
+        let remote_value_shares = vec![FE::ZERO; num];
+        let local_bit_macs = vec![F40b::ZERO; num * bit_size];
+        let local_value_macs = vec![FE::ZERO; num];
+
+        let remote_bit_chunks = split_bits(&remote_bit_shares, bit_size);
+        let mut peer_private_edabits = Vec::with_capacity(num);
+        let mut bit_mac_offset = 0;
+        for i in 0..num {
+            let mut shared_bits = Vec::with_capacity(bit_size);
+            for j in 0..bit_size {
+                let local_idx = bit_mac_offset + j;
+                shared_bits.push(AuthenticatedShare::new(
+                    MacProver::new(remote_bit_chunks[i][j], local_bit_macs[local_idx]),
+                    remote_bit_auth[local_idx],
+                ));
+            }
+            bit_mac_offset += bit_size;
+
+            peer_private_edabits.push(SharedEdabit {
+                bits: shared_bits,
+                value: AuthenticatedShare::new(
+                    MacProver::new(remote_value_shares[i], local_value_macs[i]),
+                    remote_value_auth[i],
+                ),
+            });
+        }
+
+        Ok(peer_private_edabits)
     }
 
     fn generate_checked_shared_bit_triples<C: AbstractChannel, RNG: CryptoRng + Rng>(
