@@ -85,6 +85,19 @@ struct VerifiedPrivateEdabitState<FE: FiniteField> {
     peer_private_edabits: Vec<SharedEdabit<FE>>,
 }
 
+/// Opaque checkpoint for benchmarking the original cut-and-choose pipeline.
+pub struct SampledPrivateEdabitState<FE: FiniteField> {
+    bit_size: usize,
+    num_bucket: usize,
+    num_cut: usize,
+    raw: RawPrivateEdabitState<FE>,
+}
+
+/// Opaque checkpoint after the original cut-and-choose checks have completed.
+pub struct CheckedPrivateEdabitState<FE: FiniteField> {
+    verified: VerifiedPrivateEdabitState<FE>,
+}
+
 pub struct MpcOriginalEdabitsPeer<FE: FiniteField> {
     role: PeerRole,
     pub fcom_f2: PeerFieldMacs<F40b>,
@@ -646,6 +659,62 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         )?;
         let verified = self.run_cut_and_choose(channel, rng, bit_size, num_bucket, num_cut, raw)?;
         self.combine_private_into_global_edabits(channel, rng, &verified)
+    }
+
+    /// Sample/share the raw private edaBits and triples used by the original
+    /// cut-and-choose protocol, without running the checks yet.
+    pub fn sample_and_share_private_edabits_unchecked<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<SampledPrivateEdabitState<FE>> {
+        let (num_bucket, num_cut) = select_cut_and_choose_parameters(num);
+        let num_random_edabits = num * num_bucket + num_cut;
+        let num_random_triples = num * (num_bucket - 1) * bit_size + num_cut * bit_size;
+        let raw = self.sample_and_share_private_material(
+            channel,
+            rng,
+            bit_size,
+            num_random_edabits,
+            num_random_triples,
+        )?;
+        Ok(SampledPrivateEdabitState {
+            bit_size,
+            num_bucket,
+            num_cut,
+            raw,
+        })
+    }
+
+    /// Run the original cut-and-choose check on previously sampled material.
+    pub fn verify_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        state: SampledPrivateEdabitState<FE>,
+    ) -> Result<CheckedPrivateEdabitState<FE>> {
+        let verified = self.run_cut_and_choose(
+            channel,
+            rng,
+            state.bit_size,
+            state.num_bucket,
+            state.num_cut,
+            state.raw,
+        )?;
+        Ok(CheckedPrivateEdabitState { verified })
+    }
+
+    /// Combine a previously checked original-protocol state into final global
+    /// edaBits.
+    pub fn combine_checked_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        state: &CheckedPrivateEdabitState<FE>,
+    ) -> Result<Vec<GlobalEdabit<FE>>> {
+        self.combine_private_into_global_edabits(channel, rng, &state.verified)
     }
 
     pub fn generate_global_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(

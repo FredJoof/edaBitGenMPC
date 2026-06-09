@@ -7,17 +7,13 @@ use crate::cheddabits::{
     ChedDabitGeneratorProverV1, ChedDabitGeneratorProverV2, ChedDabitGeneratorVerifierV1,
     ChedDabitGeneratorVerifierV2, DabitGeneratorProverT, DabitGeneratorVerifierT,
 };
-use crate::cheddaprg::{
-    LocalPrg, PredicateT, PrgDimensions, TSPAPredicate, Xor4Maj7Predicate,
-};
+use crate::cheddaprg::{LocalPrg, PredicateT, PrgDimensions, TSPAPredicate, Xor4Maj7Predicate};
 use crate::conv::{EdabitsProver, EdabitsVerifier, ProverFromHomComsT, VerifierFromHomComsT};
 use crate::edabits::{ProverConv, RcRefCell, VerifierConv};
 use crate::hd_quicksilver::{HDMacProver, HDMacVerifier, QSStateProver, QSStateVerifier};
 use crate::homcom::{FComProver, FComVerifier, MacProver, MacVerifier};
 use crate::mpc_conv::{GlobalEdabit, PrivateEdabit, PrivateEdabitState, SharedEdabit};
-use crate::mpc_edabits_common::{
-    convert_bits_to_field, estimate_combine_voles, MpcEdabitsCommon,
-};
+use crate::mpc_edabits_common::{convert_bits_to_field, estimate_combine_voles, MpcEdabitsCommon};
 use crate::mpc_homcom::{PeerFieldMacs, PeerRole};
 use eyre::{eyre, Result};
 use num_traits::One;
@@ -67,6 +63,17 @@ struct RemotePrivateEdabitBatch<FE: FiniteField<PrimeField = FE>> {
     peer_private_edabits: Vec<SharedEdabit<FE>>,
     peer_private_proof_edabits: Vec<EdabitsVerifier<FE>>,
     dabits: Vec<ExpandedVerifierDabit<FE>>,
+}
+
+/// Opaque checkpoint for benchmarking the MPC Chedda pipeline in phases.
+pub struct UncheckedPrivateEdabitState<
+    FE: FiniteField<PrimeField = FE>,
+    const D2: usize,
+    const DP: usize,
+> {
+    state: PrivateEdabitState<FE>,
+    local_dabits: Vec<ExpandedProverDabit<FE, D2, DP>>,
+    remote_dabits: Vec<ExpandedVerifierDabit<FE>>,
 }
 
 fn gen_powers_of_two<FE: FiniteField>(k: usize) -> Vec<FE> {
@@ -222,14 +229,14 @@ impl<
                 dabits.push(dabit);
             }
 
-            let new_seed_2_macs = self
-                .fcom_f2
-                .get_refmut()
-                .input(channel, rng, &new_seed_2_values)?;
-            let new_seed_p_macs = self
-                .fcom_fe
-                .get_refmut()
-                .input(channel, rng, &new_seed_p_values)?;
+            let new_seed_2_macs =
+                self.fcom_f2
+                    .get_refmut()
+                    .input(channel, rng, &new_seed_2_values)?;
+            let new_seed_p_macs =
+                self.fcom_fe
+                    .get_refmut()
+                    .input(channel, rng, &new_seed_p_values)?;
             channel.flush()?;
 
             let new_seed_2: Vec<_> = new_seed_2_values
@@ -314,7 +321,8 @@ impl<
             for ct in conversion_tuples {
                 debug_assert_eq!(ct.bits.len(), bit_size);
                 for bit in &ct.bits {
-                    corrections.push((F40b::from(bit.value()) + dabits[dabit_j].bit.poly[D2]).is_one());
+                    corrections
+                        .push((F40b::from(bit.value()) + dabits[dabit_j].bit.poly[D2]).is_one());
                     dabit_j += 1;
                 }
             }
@@ -659,12 +667,20 @@ impl<
         let remote_conv = VerifierConv::init_zero(fcom_f2.remote(), fcom_fe.remote())?;
         let prg_seed = Default::default();
         let local_chedda = CheddaDaBitSourceProver::new(
-            LocalPrg::<PRED, FE, LOC, D2, DP>::setup(prg_seed, PRED::SEED_LENGTH, PRED::OUTPUT_LENGTH),
+            LocalPrg::<PRED, FE, LOC, D2, DP>::setup(
+                prg_seed,
+                PRED::SEED_LENGTH,
+                PRED::OUTPUT_LENGTH,
+            ),
             fcom_f2.local(),
             fcom_fe.local(),
         )?;
         let remote_chedda = CheddaDaBitSourceVerifier::new(
-            LocalPrg::<PRED, FE, LOC, D2, DP>::setup(prg_seed, PRED::SEED_LENGTH, PRED::OUTPUT_LENGTH),
+            LocalPrg::<PRED, FE, LOC, D2, DP>::setup(
+                prg_seed,
+                PRED::SEED_LENGTH,
+                PRED::OUTPUT_LENGTH,
+            ),
             fcom_f2.remote(),
             fcom_fe.remote(),
         )?;
@@ -705,7 +721,9 @@ impl<
         bit_size: usize,
         num: usize,
     ) -> Result<RemotePrivateEdabitBatch<FE>> {
-        let dabits = self.remote_chedda.gen_dabits(channel, rng, bit_size * num)?;
+        let dabits = self
+            .remote_chedda
+            .gen_dabits(channel, rng, bit_size * num)?;
         let peer_private_edabits =
             self.receive_private_edabit_contributions_owner_zero(channel, rng, bit_size, num)?;
         let peer_private_proof_edabits = extract_verifier_edabits(&peer_private_edabits);
@@ -716,13 +734,16 @@ impl<
         })
     }
 
-    pub fn sample_and_share_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+    fn sample_and_share_private_edabits_unchecked_inner<
+        C: AbstractChannel,
+        RNG: CryptoRng + Rng,
+    >(
         &mut self,
         channel: &mut C,
         rng: &mut RNG,
         bit_size: usize,
         num: usize,
-    ) -> Result<PrivateEdabitState<FE>> {
+    ) -> Result<UncheckedPrivateEdabitState<FE, D2, DP>> {
         let (local, remote) = if self.role.is_first() {
             let local = self.sample_local_private_edabits(channel, rng, bit_size, num)?;
             let remote = self.receive_peer_private_edabits(channel, rng, bit_size, num)?;
@@ -733,32 +754,89 @@ impl<
             (local, remote)
         };
 
+        Ok(UncheckedPrivateEdabitState {
+            state: PrivateEdabitState {
+                private_edabits: local.private_edabits,
+                peer_private_edabits: remote.peer_private_edabits,
+                private_proof_edabits: local.proof_edabits,
+                peer_private_proof_edabits: remote.peer_private_proof_edabits,
+            },
+            local_dabits: local.dabits,
+            remote_dabits: remote.dabits,
+        })
+    }
+
+    /// Sampling/input plus owner/0-sharing stage, without the protocol-specific
+    /// Chedda verification yet.
+    pub fn sample_and_share_private_edabits_unchecked<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<UncheckedPrivateEdabitState<FE, D2, DP>> {
+        self.sample_and_share_private_edabits_unchecked_inner(channel, rng, bit_size, num)
+    }
+
+    /// Run the Chedda consistency check on previously sampled private edaBits.
+    pub fn verify_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        state: &UncheckedPrivateEdabitState<FE, D2, DP>,
+    ) -> Result<()> {
         if self.role.is_first() {
-            self.local_chedda
-                .verify_edabits(channel, rng, &local.proof_edabits, &local.dabits)?;
+            self.local_chedda.verify_edabits(
+                channel,
+                rng,
+                &state.state.private_proof_edabits,
+                &state.local_dabits,
+            )?;
             self.remote_chedda.verify_edabits(
                 channel,
                 rng,
-                &remote.peer_private_proof_edabits,
-                &remote.dabits,
+                &state.state.peer_private_proof_edabits,
+                &state.remote_dabits,
             )?;
         } else {
             self.remote_chedda.verify_edabits(
                 channel,
                 rng,
-                &remote.peer_private_proof_edabits,
-                &remote.dabits,
+                &state.state.peer_private_proof_edabits,
+                &state.remote_dabits,
             )?;
-            self.local_chedda
-                .verify_edabits(channel, rng, &local.proof_edabits, &local.dabits)?;
+            self.local_chedda.verify_edabits(
+                channel,
+                rng,
+                &state.state.private_proof_edabits,
+                &state.local_dabits,
+            )?;
         }
+        Ok(())
+    }
 
-        Ok(PrivateEdabitState {
-            private_edabits: local.private_edabits,
-            peer_private_edabits: remote.peer_private_edabits,
-            private_proof_edabits: local.proof_edabits,
-            peer_private_proof_edabits: remote.peer_private_proof_edabits,
-        })
+    /// Combine a previously sampled-and-verified private state into the final
+    /// authenticated global edaBits.
+    pub fn combine_sampled_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        state: &UncheckedPrivateEdabitState<FE, D2, DP>,
+    ) -> Result<Vec<GlobalEdabit<FE>>> {
+        self.combine_private_into_global_edabits(channel, rng, &state.state)
+    }
+
+    pub fn sample_and_share_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<PrivateEdabitState<FE>> {
+        let state =
+            self.sample_and_share_private_edabits_unchecked_inner(channel, rng, bit_size, num)?;
+        self.verify_private_edabits(channel, rng, &state)?;
+        Ok(state.state)
     }
 
     pub fn combine_private_into_global_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
@@ -820,6 +898,9 @@ pub type MpcCheddaEdabitsV1TSPAPeer<FE> = MpcCheddaEdabitsPeer<
     { TSPAPredicate::DP },
 >;
 
+pub type TSPAUncheckedPrivateEdabitState<FE> =
+    UncheckedPrivateEdabitState<FE, { TSPAPredicate::D2 }, { TSPAPredicate::DP }>;
+
 pub type MpcCheddaEdabitsV2TSPAPeer<FE> = MpcCheddaEdabitsPeer<
     FE,
     ChedDabitGeneratorProverV2<FE>,
@@ -840,6 +921,9 @@ pub type MpcCheddaEdabitsV1Xor4Maj7Peer<FE> = MpcCheddaEdabitsPeer<
     { Xor4Maj7Predicate::DP },
 >;
 
+pub type Xor4Maj7UncheckedPrivateEdabitState<FE> =
+    UncheckedPrivateEdabitState<FE, { Xor4Maj7Predicate::D2 }, { Xor4Maj7Predicate::DP }>;
+
 pub type MpcCheddaEdabitsV2Xor4Maj7Peer<FE> = MpcCheddaEdabitsPeer<
     FE,
     ChedDabitGeneratorProverV2<FE>,
@@ -855,10 +939,7 @@ mod tests {
     use super::*;
     use ocelot::svole::wykw::{LPN_EXTEND_SMALL, LPN_SETUP_SMALL};
     use rand::SeedableRng;
-    use scuttlebutt::{
-        field::F61p,
-        AesRng, Channel,
-    };
+    use scuttlebutt::{field::F61p, AesRng, Channel};
     use std::{
         io::{BufReader, BufWriter},
         os::unix::net::UnixStream,
@@ -866,11 +947,7 @@ mod tests {
 
     type TestPeer = MpcCheddaEdabitsV1TSPAPeer<F61p>;
 
-    fn fixed_clear_edabits(
-        owner: usize,
-        bit_size: usize,
-        num: usize,
-    ) -> (Vec<Vec<F2>>, Vec<F61p>) {
+    fn fixed_clear_edabits(owner: usize, bit_size: usize, num: usize) -> (Vec<Vec<F2>>, Vec<F61p>) {
         let mut clear_bits = Vec::with_capacity(num);
         let mut clear_values = Vec::with_capacity(num);
         for row in 0..num {
@@ -923,9 +1000,7 @@ mod tests {
                 .seed_2
                 .iter()
                 .zip(peer.local_chedda.seed_p.iter())
-                .map(|(bit, value)| {
-                    (bit.value(), value.value(), bit.mac(), value.mac())
-                })
+                .map(|(bit, value)| (bit.value(), value.value(), bit.mac(), value.mac()))
                 .collect::<Vec<_>>()
         });
 
@@ -994,14 +1069,21 @@ mod tests {
             LPN_EXTEND_SMALL,
         )
         .unwrap();
-        let verifier_dabits = peer.remote_chedda.gen_dabits(&mut channel, &mut rng, 32).unwrap();
+        let verifier_dabits = peer
+            .remote_chedda
+            .gen_dabits(&mut channel, &mut rng, 32)
+            .unwrap();
         let prover_dabits = handle.join().unwrap();
         assert_eq!(prover_dabits.len(), verifier_dabits.len());
         for (i, (bit, field_bit)) in prover_dabits.into_iter().enumerate() {
             assert!(bit == F2::ZERO || bit == F2::ONE);
             assert_eq!(
                 field_bit,
-                if bit == F2::ONE { F61p::ONE } else { F61p::ZERO }
+                if bit == F2::ONE {
+                    F61p::ONE
+                } else {
+                    F61p::ZERO
+                }
             );
             assert!(verifier_dabits[i].bit.qs_degree >= 1);
             assert!(verifier_dabits[i].value.qs_degree >= 1);
@@ -1024,7 +1106,10 @@ mod tests {
                 LPN_EXTEND_SMALL,
             )
             .unwrap();
-            let dabits = peer.local_chedda.gen_dabits(&mut channel, &mut rng, 24).unwrap();
+            let dabits = peer
+                .local_chedda
+                .gen_dabits(&mut channel, &mut rng, 24)
+                .unwrap();
             prover_dabits_to_clear_edabits_generic(&dabits, 8)
         });
 
@@ -1040,7 +1125,9 @@ mod tests {
             LPN_EXTEND_SMALL,
         )
         .unwrap();
-        peer.remote_chedda.gen_dabits(&mut channel, &mut rng, 24).unwrap();
+        peer.remote_chedda
+            .gen_dabits(&mut channel, &mut rng, 24)
+            .unwrap();
         let (clear_bits, clear_values) = handle.join().unwrap();
         assert_eq!(clear_bits.len(), 3);
         assert_eq!(clear_values.len(), 3);
@@ -1148,7 +1235,12 @@ mod tests {
                         )
                         .unwrap(),
                     peer_private_edabits: peer
-                        .receive_private_edabit_contributions_owner_zero(&mut channel, &mut rng, 8, 8)
+                        .receive_private_edabit_contributions_owner_zero(
+                            &mut channel,
+                            &mut rng,
+                            8,
+                            8,
+                        )
                         .unwrap(),
                     private_proof_edabits: Vec::new(),
                     peer_private_proof_edabits: Vec::new(),
@@ -1209,7 +1301,8 @@ mod tests {
             let global_edabits = peer
                 .generate_global_edabits(&mut channel, &mut rng, bit_size, num)
                 .unwrap();
-            peer.open_global_edabits(&mut channel, &global_edabits).unwrap()
+            peer.open_global_edabits(&mut channel, &global_edabits)
+                .unwrap()
         });
 
         let mut rng = AesRng::from_seed(Default::default());
@@ -1227,7 +1320,9 @@ mod tests {
         let global_edabits = peer
             .generate_global_edabits(&mut channel, &mut rng, bit_size, num)
             .unwrap();
-        let opened = peer.open_global_edabits(&mut channel, &global_edabits).unwrap();
+        let opened = peer
+            .open_global_edabits(&mut channel, &global_edabits)
+            .unwrap();
         let opened_first = handle.join().unwrap();
         assert_eq!(opened, opened_first);
         opened
@@ -1235,8 +1330,8 @@ mod tests {
 
     #[test]
     fn test_mpc_chedda_global_edabits_roundtrip() {
-        let opened = run_opened_global_edabits(8, 1024);
-        assert_eq!(opened.len(), 1024);
+        let opened = run_opened_global_edabits(8, 6000);
+        assert_eq!(opened.len(), 6000);
         for (bits, value) in opened {
             assert_eq!(value, convert_bits_to_field::<F61p>(&bits));
         }
@@ -1279,7 +1374,8 @@ mod tests {
             let global_edabits = peer
                 .combine_private_into_global_edabits(&mut channel, &mut rng, &state)
                 .unwrap();
-            peer.open_global_edabits(&mut channel, &global_edabits).unwrap()
+            peer.open_global_edabits(&mut channel, &global_edabits)
+                .unwrap()
         });
 
         let mut rng = AesRng::from_seed(Default::default());
@@ -1315,7 +1411,9 @@ mod tests {
         let global_edabits = peer
             .combine_private_into_global_edabits(&mut channel, &mut rng, &state)
             .unwrap();
-        let opened = peer.open_global_edabits(&mut channel, &global_edabits).unwrap();
+        let opened = peer
+            .open_global_edabits(&mut channel, &global_edabits)
+            .unwrap();
         let opened_first = handle.join().unwrap();
         assert_eq!(opened, opened_first);
 

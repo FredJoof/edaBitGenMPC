@@ -37,6 +37,7 @@ use scuttlebutt::{
     ring::FiniteRing,
     AbstractChannel,
 };
+use std::time::Duration;
 
 struct LocalPrivateEdabitBatch<FE: FiniteField> {
     private_edabits: Vec<PrivateEdabit<FE>>,
@@ -46,6 +47,12 @@ struct LocalPrivateEdabitBatch<FE: FiniteField> {
 struct RemotePrivateEdabitBatch<FE: FiniteField> {
     peer_private_edabits: Vec<SharedEdabit<FE>>,
     peer_private_proof_edabits: Vec<crate::conv::EdabitsVerifier<FE>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MpcEdabitsCheckBreakdown {
+    pub aux: Duration,
+    pub core: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -471,6 +478,27 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
             num,
             PrivateInputSharingPolicy::OwnerZero,
         )
+    }
+
+    /// Run the existing conversion-consistency check on previously sampled
+    /// private edaBits.
+    pub fn verify_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        state: &PrivateEdabitState<FE>,
+    ) -> Result<()> {
+        let (num_bucket, num_cut) = select_cut_and_choose_parameters(state.len());
+        self.cut_and_choose_private(channel, rng, num_bucket, num_cut, state)
+    }
+
+    pub fn last_check_breakdown(&self) -> MpcEdabitsCheckBreakdown {
+        let local = self.local_conv.last_conv_timing();
+        let remote = self.remote_conv.last_conv_timing();
+        MpcEdabitsCheckBreakdown {
+            aux: local.aux + remote.aux,
+            core: local.core + remote.core,
+        }
     }
 
     fn sample_and_share_private_edabits_with_policy<C: AbstractChannel, RNG: CryptoRng + Rng>(

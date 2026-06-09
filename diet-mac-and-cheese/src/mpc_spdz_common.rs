@@ -6,11 +6,7 @@ use crate::mpc_spdz_conv::{
 };
 use eyre::{eyre, Result};
 use generic_array::{typenum::Unsigned, GenericArray};
-use ocelot::{
-    ot::{
-        KosReceiver, KosSender, Receiver as OcelotReceiver, Sender as OcelotSender,
-    },
-};
+use ocelot::ot::{KosReceiver, KosSender, Receiver as OcelotReceiver, Sender as OcelotSender};
 use rand::{CryptoRng, Rng};
 use scuttlebutt::{
     field::{Degree, F40b, FiniteField, F2},
@@ -71,7 +67,12 @@ impl<FE: FiniteField> SpdzCopeeSender<FE> {
     ) -> Result<Self> {
         let nbits = <FE::PrimeField as FiniteField>::NumberOfBitsInBitDecomposition::USIZE;
         let mut ot = KosSender::init(channel, rng)?;
-        let keys = ocelot::ot::RandomSender::send_random(&mut ot, channel, nbits * Degree::<FE>::USIZE, rng)?;
+        let keys = ocelot::ot::RandomSender::send_random(
+            &mut ot,
+            channel,
+            nbits * Degree::<FE>::USIZE,
+            rng,
+        )?;
         let aes_objs = keys
             .iter()
             .map(|(k0, k1)| (Aes128::new(*k0), Aes128::new(*k1)))
@@ -92,11 +93,7 @@ impl<FE: FiniteField> SpdzCopeeSender<FE> {
         })
     }
 
-    fn send<C: AbstractChannel>(
-        &mut self,
-        channel: &mut C,
-        input: &FE::PrimeField,
-    ) -> Result<FE> {
+    fn send<C: AbstractChannel>(&mut self, channel: &mut C, input: &FE::PrimeField) -> Result<FE> {
         let pt = Block::from(self.counter as u128);
         let mut w = FE::ZERO;
         for (i, pow) in self.powers.iter().enumerate() {
@@ -256,7 +253,10 @@ impl SpdzOtExt {
         role: PeerRole,
     ) -> Result<Self> {
         let (sender, receiver) = if role.is_first() {
-            (KosSender::init(channel, rng)?, KosReceiver::init(channel, rng)?)
+            (
+                KosSender::init(channel, rng)?,
+                KosReceiver::init(channel, rng)?,
+            )
         } else {
             let receiver = KosReceiver::init(channel, rng)?;
             let sender = KosSender::init(channel, rng)?;
@@ -297,7 +297,9 @@ fn exchange_sequence<T: CanonicalSerialize, C: AbstractChannel>(
     if role.is_first() {
         channel.write_serializable_seq(values)?;
         channel.flush()?;
-        channel.read_serializable_seq(values.len()).map_err(Into::into)
+        channel
+            .read_serializable_seq(values.len())
+            .map_err(Into::into)
     } else {
         let remote = channel.read_serializable_seq(values.len())?;
         channel.write_serializable_seq(values)?;
@@ -423,8 +425,10 @@ pub(crate) trait MpcSpdzCommon<FE: FiniteField<PrimeField = FE>> {
         let mut coeff = F40b::ONE;
         let mut local_check = F40b::ZERO;
         for (share, value) in shares.iter().zip(opened.iter().copied()) {
-            local_check +=
-                coeff * (share.mac - self.spdz_f2().alpha_share() * lift_prime_to_field::<F40b>(f2_to_fe::<F40b>(value)));
+            local_check += coeff
+                * (share.mac
+                    - self.spdz_f2().alpha_share()
+                        * lift_prime_to_field::<F40b>(f2_to_fe::<F40b>(value)));
             coeff *= chi;
         }
         let remote_check = exchange_sequence(channel, self.role(), &[local_check])?;
@@ -552,7 +556,10 @@ pub(crate) trait MpcSpdzCommon<FE: FiniteField<PrimeField = FE>> {
                 .zip(mac_shares)
                 .zip(reverse_mac)
                 .map(|((share, mac), reverse)| {
-                    SpdzAuthenticatedShare::new(share, mac + block_to_field::<F40b>(reverse).unwrap())
+                    SpdzAuthenticatedShare::new(
+                        share,
+                        mac + block_to_field::<F40b>(reverse).unwrap(),
+                    )
                 })
                 .collect())
         } else {
@@ -613,11 +620,7 @@ pub(crate) trait MpcSpdzCommon<FE: FiniteField<PrimeField = FE>> {
             for &bit in sender_bits {
                 let r = FE::random(rng);
                 value_shares.push(-r);
-                let delta_value = if bit == F2::ONE {
-                    FE::ONE
-                } else {
-                    FE::ZERO
-                };
+                let delta_value = if bit == F2::ONE { FE::ONE } else { FE::ZERO };
                 value_msgs.push((field_to_block(r), field_to_block(r + delta_value)));
 
                 let rho = FE::random(rng);
@@ -825,7 +828,13 @@ pub(crate) trait MpcSpdzCommon<FE: FiniteField<PrimeField = FE>> {
 
         let local_field_bits: Vec<_> = bits
             .iter()
-            .map(|bit| if bit.share == F2::ONE { FE::ONE } else { FE::ZERO })
+            .map(|bit| {
+                if bit.share == F2::ONE {
+                    FE::ONE
+                } else {
+                    FE::ZERO
+                }
+            })
             .collect();
         let (local_contribs, peer_contribs) = if self.role().is_first() {
             (
@@ -881,7 +890,9 @@ pub(crate) trait MpcSpdzCommon<FE: FiniteField<PrimeField = FE>> {
         arithmetic_sums
             .iter()
             .zip(carry_field_shares.iter())
-            .map(|(sum, carry)| self.add_field_shares(*sum, self.scale_field_share(*carry, correction_scale)))
+            .map(|(sum, carry)| {
+                self.add_field_shares(*sum, self.scale_field_share(*carry, correction_scale))
+            })
             .collect()
     }
 
@@ -943,7 +954,8 @@ pub(crate) trait MpcSpdzCommon<FE: FiniteField<PrimeField = FE>> {
             &first_party_private,
             &second_party_private,
         )?;
-        let carry_field_shares = self.convert_shared_bits_to_field(channel, rng, &overflow_carries)?;
+        let carry_field_shares =
+            self.convert_shared_bits_to_field(channel, rng, &overflow_carries)?;
         let arithmetic_sums =
             self.sum_private_arithmetic_shares(private_edabits, peer_private_edabits);
         let corrected_values =

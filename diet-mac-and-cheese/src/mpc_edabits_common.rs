@@ -339,16 +339,16 @@ pub(crate) trait MpcEdabitsCommon<FE: FiniteField<PrimeField = FE>> {
         debug_assert_eq!(num, clear_values.len());
 
         let flat_local_bits = flatten_bits(clear_bits);
-        let local_bit_macs = self
-            .fcom_f2_mut()
-            .local()
-            .get_refmut()
-            .input(channel, rng, &flat_local_bits)?;
-        let local_value_macs = self
-            .fcom_fe_mut()
-            .local()
-            .get_refmut()
-            .input(channel, rng, clear_values)?;
+        let local_bit_macs =
+            self.fcom_f2_mut()
+                .local()
+                .get_refmut()
+                .input(channel, rng, &flat_local_bits)?;
+        let local_value_macs =
+            self.fcom_fe_mut()
+                .local()
+                .get_refmut()
+                .input(channel, rng, clear_values)?;
         channel.flush()?;
 
         let remote_bit_auth = vec![self.zero_bit_share().remote; flat_local_bits.len()];
@@ -472,21 +472,18 @@ pub(crate) trait MpcEdabitsCommon<FE: FiniteField<PrimeField = FE>> {
             .collect())
     }
 
-    fn receive_private_edabit_contributions_owner_zero<
-        C: AbstractChannel,
-        RNG: CryptoRng + Rng,
-    >(
+    fn receive_private_edabit_contributions_owner_zero<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
         rng: &mut RNG,
         bit_size: usize,
         num: usize,
     ) -> Result<Vec<SharedEdabit<FE>>> {
-        let remote_bit_auth = self
-            .fcom_f2_mut()
-            .remote()
-            .get_refmut()
-            .input(channel, rng, num * bit_size)?;
+        let remote_bit_auth =
+            self.fcom_f2_mut()
+                .remote()
+                .get_refmut()
+                .input(channel, rng, num * bit_size)?;
         let remote_value_auth = self
             .fcom_fe_mut()
             .remote()

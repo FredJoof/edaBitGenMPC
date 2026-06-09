@@ -22,7 +22,7 @@ use scuttlebutt::{
 };
 use std::io::{BufReader, BufWriter};
 use std::net::TcpStream;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{
     cell::{RefCell, RefMut},
     rc::Rc,
@@ -245,11 +245,18 @@ impl<X> Clone for RcRefCell<X> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConvTimingBreakdown {
+    pub aux: Duration,
+    pub core: Duration,
+}
+
 /// Prover for the edabits conversion protocol
 pub struct ProverConv<FE: FiniteField> {
     #[allow(missing_docs)]
     pub fcom_f2: RcRefCell<FComProver<F40b>>,
     fcom_fe: RcRefCell<FComProver<FE>>,
+    last_conv_timing: ConvTimingBreakdown,
 }
 
 // The Finite field is required to be a prime field because of the fdabit
@@ -267,6 +274,7 @@ impl<FE: FiniteField<PrimeField = FE>> ProverConv<FE> {
         Ok(Self {
             fcom_f2: RcRefCell::new(a),
             fcom_fe: RcRefCell::new(b),
+            last_conv_timing: ConvTimingBreakdown::default(),
         })
     }
 
@@ -282,6 +290,7 @@ impl<FE: FiniteField<PrimeField = FE>> ProverConv<FE> {
         Ok(Self {
             fcom_f2: fcom_f2.clone(),
             fcom_fe: RcRefCell::new(b),
+            last_conv_timing: ConvTimingBreakdown::default(),
         })
     }
 
@@ -293,6 +302,7 @@ impl<FE: FiniteField<PrimeField = FE>> ProverConv<FE> {
         Ok(Self {
             fcom_f2: fcom_f2.clone(),
             fcom_fe: fcom_fe.clone(),
+            last_conv_timing: ConvTimingBreakdown::default(),
         })
     }
 
@@ -307,7 +317,12 @@ impl<FE: FiniteField<PrimeField = FE>> ProverConv<FE> {
                 self.fcom_f2.get_refmut().duplicate(channel, rng)?,
             ))),
             fcom_fe: RcRefCell::new(self.fcom_fe.get_refmut().duplicate(channel, rng)?),
+            last_conv_timing: ConvTimingBreakdown::default(),
         })
+    }
+
+    pub fn last_conv_timing(&self) -> ConvTimingBreakdown {
+        self.last_conv_timing
     }
 
     fn convert_bit_2_field<C: AbstractChannel>(
@@ -878,6 +893,7 @@ impl<FE: FiniteField<PrimeField = FE>> ProverConv<FE> {
         let n = edabits_vector.len();
         if n == 0 {
             info!("conversion check on no conversions");
+            self.last_conv_timing = ConvTimingBreakdown::default();
             return Ok(());
         }
         let nb_bits = edabits_vector[0].bits.len();
@@ -890,6 +906,7 @@ impl<FE: FiniteField<PrimeField = FE>> ProverConv<FE> {
 
         let nb_random_edabits = n * num_bucket + num_cut;
         let nb_random_dabits = n * num_bucket;
+        let aux_start = Instant::now();
 
         // step 1)a): commit random edabit
         let mut r = self.random_edabits(channel, rng, nb_bits, nb_random_edabits)?;
@@ -922,6 +939,8 @@ impl<FE: FiniteField<PrimeField = FE>> ProverConv<FE> {
 
         // step 5) b):
         // unnecessary step with quicksilver mult check
+        let aux = aux_start.elapsed();
+        let core_start = Instant::now();
 
         // step 6)
         if bucket_channels.is_none() {
@@ -998,6 +1017,11 @@ impl<FE: FiniteField<PrimeField = FE>> ProverConv<FE> {
             }
             */
         }
+
+        self.last_conv_timing = ConvTimingBreakdown {
+            aux,
+            core: core_start.elapsed(),
+        };
 
         Ok(())
     }
@@ -1170,6 +1194,7 @@ pub struct VerifierConv<FE: FiniteField> {
     #[allow(missing_docs)]
     pub fcom_f2: RcRefCell<FComVerifier<F40b>>,
     fcom_fe: RcRefCell<FComVerifier<FE>>,
+    last_conv_timing: ConvTimingBreakdown,
 }
 
 // The Finite field is required to be a prime field because of the fdabit
@@ -1187,6 +1212,7 @@ impl<FE: FiniteField<PrimeField = FE>> VerifierConv<FE> {
         Ok(Self {
             fcom_f2: RcRefCell::new(a),
             fcom_fe: RcRefCell::new(b),
+            last_conv_timing: ConvTimingBreakdown::default(),
         })
     }
 
@@ -1203,6 +1229,7 @@ impl<FE: FiniteField<PrimeField = FE>> VerifierConv<FE> {
         Ok(Self {
             fcom_f2: RcRefCell::new(a),
             fcom_fe: RcRefCell::new(b),
+            last_conv_timing: ConvTimingBreakdown::default(),
         })
     }
 
@@ -1214,6 +1241,7 @@ impl<FE: FiniteField<PrimeField = FE>> VerifierConv<FE> {
         Ok(Self {
             fcom_f2: fcom_f2.clone(),
             fcom_fe: fcom_fe.clone(),
+            last_conv_timing: ConvTimingBreakdown::default(),
         })
     }
 
@@ -1226,7 +1254,12 @@ impl<FE: FiniteField<PrimeField = FE>> VerifierConv<FE> {
         Ok(Self {
             fcom_f2: RcRefCell::new(self.fcom_f2.get_refmut().duplicate(channel, rng)?),
             fcom_fe: RcRefCell::new(self.fcom_fe.get_refmut().duplicate(channel, rng)?),
+            last_conv_timing: ConvTimingBreakdown::default(),
         })
+    }
+
+    pub fn last_conv_timing(&self) -> ConvTimingBreakdown {
+        self.last_conv_timing
     }
 
     fn convert_bit_2_field<C: AbstractChannel>(
@@ -1709,6 +1742,7 @@ impl<FE: FiniteField<PrimeField = FE>> VerifierConv<FE> {
         let n = edabits_vector_mac.len();
         if n == 0 {
             info!("conversion check on no conversions");
+            self.last_conv_timing = ConvTimingBreakdown::default();
             return Ok(());
         }
 
@@ -1722,7 +1756,7 @@ impl<FE: FiniteField<PrimeField = FE>> VerifierConv<FE> {
         let nb_random_edabits = n * num_bucket + num_cut;
         let nb_random_dabits = n * num_bucket;
 
-        let phase1 = Instant::now();
+        let aux_start = Instant::now();
         // step 1)a)
         debug!("Step 1)a) RANDOM EDABITS ... ");
         let start = Instant::now();
@@ -1782,9 +1816,9 @@ impl<FE: FiniteField<PrimeField = FE>> VerifierConv<FE> {
         // step 5) b):
         // unnecessary step with quicksilver mult check
 
-        debug!("Total Steps 1-2-3-4-5: {:?}", phase1.elapsed());
+        let aux = aux_start.elapsed();
 
-        let phase2 = Instant::now();
+        let core_start = Instant::now();
         // step 6)
         debug!("step 6)a-e) bitADDcarry etc: ... ");
 
@@ -1872,7 +1906,9 @@ impl<FE: FiniteField<PrimeField = FE>> VerifierConv<FE> {
             }
             */
         }
-        debug!("step 6)a-e) bitADDcarry etc: {:?}", phase2.elapsed());
+        let core = core_start.elapsed();
+        debug!("step 6)a-e) bitADDcarry etc: {:?}", core);
+        self.last_conv_timing = ConvTimingBreakdown { aux, core };
 
         Ok(())
     }

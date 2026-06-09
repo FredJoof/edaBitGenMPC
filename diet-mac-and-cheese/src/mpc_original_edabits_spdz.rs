@@ -13,12 +13,8 @@
 use crate::mpc_edabits_common::{convert_bits_to_field, split_bits};
 use crate::mpc_homcom::PeerRole;
 use crate::mpc_original_edabits::select_cut_and_choose_parameters;
-use crate::mpc_spdz_common::{
-    MpcSpdzCommon, SpdzFieldBackend, SpdzOtExt, SpdzSharedBitTriple,
-};
-use crate::mpc_spdz_conv::{
-    SpdzGlobalEdabit, SpdzPrivateEdabit, SpdzSharedEdabit,
-};
+use crate::mpc_spdz_common::{MpcSpdzCommon, SpdzFieldBackend, SpdzOtExt, SpdzSharedBitTriple};
+use crate::mpc_spdz_conv::{SpdzGlobalEdabit, SpdzPrivateEdabit, SpdzSharedEdabit};
 use eyre::{eyre, Result};
 use ocelot::svole::wykw::LpnParams;
 use rand::{CryptoRng, Rng, SeedableRng};
@@ -165,7 +161,10 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsSpdzPeer<FE> {
             clear_bits.push(bits);
         }
 
-        let flat_bits: Vec<_> = clear_bits.iter().flat_map(|bits| bits.iter().copied()).collect();
+        let flat_bits: Vec<_> = clear_bits
+            .iter()
+            .flat_map(|bits| bits.iter().copied())
+            .collect();
         let shared_bits = self.share_owned_f2_values(channel, rng, &flat_bits)?;
         let shared_values = self.share_owned_fe_values(channel, rng, &clear_values)?;
 
@@ -678,8 +677,12 @@ mod tests {
             )
             .unwrap();
             let values = [F61p::ONE, F61p::try_from(7u128).unwrap()];
-            let shares = peer.share_owned_fe_values(&mut channel, &mut rng, &values).unwrap();
-            let opened = peer.open_shared_field_batch(&mut channel, &mut rng, &shares).unwrap();
+            let shares = peer
+                .share_owned_fe_values(&mut channel, &mut rng, &values)
+                .unwrap();
+            let opened = peer
+                .open_shared_field_batch(&mut channel, &mut rng, &shares)
+                .unwrap();
             assert_eq!(opened, values);
         });
 
@@ -721,7 +724,9 @@ mod tests {
             )
             .unwrap();
             let bits = [F2::ZERO, F2::ONE, F2::ONE, F2::ZERO];
-            let shared_bits = peer.share_owned_f2_values(&mut channel, &mut rng, &bits).unwrap();
+            let shared_bits = peer
+                .share_owned_f2_values(&mut channel, &mut rng, &bits)
+                .unwrap();
             let field_bits = peer
                 .convert_shared_bits_to_field(&mut channel, &mut rng, &shared_bits)
                 .unwrap();
@@ -732,7 +737,14 @@ mod tests {
                 .open_shared_field_batch(&mut channel, &mut rng, &field_bits)
                 .unwrap();
             for (bit, field) in opened_bits.into_iter().zip(opened_fields) {
-                assert_eq!(if bit == F2::ONE { F61p::ONE } else { F61p::ZERO }, field);
+                assert_eq!(
+                    if bit == F2::ONE {
+                        F61p::ONE
+                    } else {
+                        F61p::ZERO
+                    },
+                    field
+                );
             }
         });
 
@@ -759,7 +771,14 @@ mod tests {
             .open_shared_field_batch(&mut channel, &mut rng, &field_bits)
             .unwrap();
         for (bit, field) in opened_bits.into_iter().zip(opened_fields) {
-            assert_eq!(if bit == F2::ONE { F61p::ONE } else { F61p::ZERO }, field);
+            assert_eq!(
+                if bit == F2::ONE {
+                    F61p::ONE
+                } else {
+                    F61p::ZERO
+                },
+                field
+            );
         }
 
         handle.join().unwrap();
