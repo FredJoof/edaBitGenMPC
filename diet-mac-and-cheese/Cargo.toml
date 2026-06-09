@@ -45,6 +45,10 @@ swanky-flatbuffer-build.workspace = true
 criterion.workspace = true
 
 [[example]]
+name = "bench_edabits_impls"
+path = "examples/bench_edabits_impls.rs"
+
+[[example]]
 name = "network_edabits"
 path = "examples/network_edabits.rs"
 
