@@ -1,4 +1,12 @@
 use diet_mac_and_cheese::{
+    cheddabits::{
+        ChedDabitGeneratorProverV1, ChedDabitGeneratorProverV2, ChedDabitGeneratorVerifierV1,
+        ChedDabitGeneratorVerifierV2, DabitGeneratorProverT, DabitGeneratorVerifierT,
+    },
+    cheddaprg::{PrgDimensions, TSPAPredicate, Xor4Maj7Predicate},
+    conv::{ConvProverT, ConvVerifierT},
+    edabits::{ProverConv, RcRefCell, VerifierConv},
+    homcom::{FComProver, FComVerifier},
     mpc_chedda_edabits::{
         MpcCheddaEdabitsV1TSPAPeer, MpcCheddaEdabitsV1Xor4Maj7Peer, MpcCheddaEdabitsV2TSPAPeer,
         MpcCheddaEdabitsV2Xor4Maj7Peer, TSPAUncheckedPrivateEdabitState,
@@ -12,10 +20,12 @@ use diet_mac_and_cheese::{
     },
 };
 use eyre::Result;
-use ocelot::svole::wykw::{LpnParams, LPN_EXTEND_SMALL, LPN_SETUP_SMALL};
+use generic_array::typenum::Unsigned;
+use ocelot::svole::wykw::{LpnParams, LPN_EXTEND_MEDIUM, LPN_SETUP_MEDIUM, LPN_EXTEND_SMALL, LPN_SETUP_SMALL};
 use rand::{CryptoRng, Rng};
 use scuttlebutt::{
-    field::F61p, track_unix_channel_pair, AbstractChannel, AesRng, TrackUnixChannel,
+    field::{Degree, F40b, F61p, FiniteField},
+    track_unix_channel_pair, AbstractChannel, AesRng, TrackUnixChannel,
 };
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -26,7 +36,7 @@ const BIT_SIZES: &[usize] = &[32];
 /// Number of edaBits to generate per run, swept independently of bit length.
 /// The cut-and-choose parameter selection (shared by all protocols here)
 /// asserts `num_edabits >= 1024`, so the sweep can't go below that.
-const NUM_EDABITS: &[usize] = &[4096];
+const NUM_EDABITS: &[usize] = &[1024, 4096, 16_384, 65_536, 262_144];
 
 /// LPN parameters shared by all protocols. `SMALL` keeps the sweep fast;
 /// switch to `LPN_SETUP_MEDIUM`/`LPN_EXTEND_MEDIUM` for more realistic
@@ -34,11 +44,17 @@ const NUM_EDABITS: &[usize] = &[4096];
 const LPN_SETUP: LpnParams = LPN_SETUP_SMALL;
 const LPN_EXTEND: LpnParams = LPN_EXTEND_SMALL;
 
+/// If enabled, reserve the estimated VOLE working set immediately after
+/// `bench_init`, so later lazy refills are charged to `init`.
+const PREFILL_VOLES_IN_INIT: bool = true;
+
 /// Small hidden warm-up to reduce first-run noise without doubling the real
 /// benchmark cost for large batches.
 const WARMUP_BIT_SIZE: usize = 32;
 const WARMUP_NUM_EDABITS: usize = 1024;
 const WARMUP_ROUNDS: usize = 1;
+
+const FDABIT_SECURITY_PARAMETER: usize = 38;
 
 /// Wall-clock time and total communication (both directions, in kilobits) for
 /// a single protocol phase, combined across both parties.
@@ -88,6 +104,142 @@ struct BenchResult {
     total: PhaseMetrics,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct VoleReservePlan {
+    local_f2: usize,
+    remote_f2: usize,
+    local_fe: usize,
+    remote_fe: usize,
+}
+
+impl VoleReservePlan {
+    fn plus(self, other: Self) -> Self {
+        Self {
+            local_f2: self.local_f2 + other.local_f2,
+            remote_f2: self.remote_f2 + other.remote_f2,
+            local_fe: self.local_fe + other.local_fe,
+            remote_fe: self.remote_fe + other.remote_fe,
+        }
+    }
+
+    fn scale(self, factor: usize) -> Self {
+        Self {
+            local_f2: self.local_f2 * factor,
+            remote_f2: self.remote_f2 * factor,
+            local_fe: self.local_fe * factor,
+            remote_fe: self.remote_fe * factor,
+        }
+    }
+}
+
+fn fdabit_gamma(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        std::mem::size_of::<usize>() * 8 - ((n + 1).leading_zeros() as usize)
+    }
+}
+
+fn combine_reserve_plan<FE: FiniteField<PrimeField = FE>>(
+    role: PeerRole,
+    num: usize,
+    bit_size: usize,
+) -> VoleReservePlan {
+    let triple_count = num * bit_size;
+    let sender = VoleReservePlan {
+        local_f2: 6 * triple_count + Degree::<F40b>::USIZE + 2 * num + FDABIT_SECURITY_PARAMETER,
+        remote_f2: 3 * triple_count + num,
+        local_fe: 2 * num + 2 * FDABIT_SECURITY_PARAMETER * fdabit_gamma(num) + Degree::<FE>::USIZE,
+        remote_fe: num,
+    };
+    if role.is_first() {
+        sender
+    } else {
+        VoleReservePlan {
+            local_f2: sender.remote_f2,
+            remote_f2: sender.local_f2,
+            local_fe: sender.remote_fe,
+            remote_fe: sender.local_fe,
+        }
+    }
+}
+
+fn chedda_source_plan<
+    FE: FiniteField<PrimeField = FE>,
+    DGP: DabitGeneratorProverT<FE>,
+    DGV: DabitGeneratorVerifierT<FE>,
+    PRED: PrgDimensions,
+    const D2: usize,
+    const DP: usize,
+>(
+    num_dabits: usize,
+) -> VoleReservePlan {
+    if num_dabits == 0 {
+        return VoleReservePlan::default();
+    }
+
+    let prg_seed_size = PRED::SEED_LENGTH;
+    let dabits_per_expansion = PRED::OUTPUT_LENGTH - PRED::SEED_LENGTH;
+    let num_expansions = (num_dabits + dabits_per_expansion - 1) / dabits_per_expansion;
+
+    let (mut local_f2, mut local_fe) = DGP::estimate_voles(prg_seed_size);
+    let (mut remote_f2, mut remote_fe) = DGV::estimate_voles(prg_seed_size);
+
+    if num_expansions > 1 {
+        local_f2 += (num_expansions - 1) * (prg_seed_size + (D2 - 1) * Degree::<F40b>::USIZE);
+        local_fe += (num_expansions - 1) * (prg_seed_size + (DP - 1) * Degree::<FE>::USIZE);
+        remote_f2 += (num_expansions - 1) * (prg_seed_size + (D2 - 1) * Degree::<F40b>::USIZE);
+        remote_fe += (num_expansions - 1) * (prg_seed_size + (DP - 1) * Degree::<FE>::USIZE);
+    }
+
+    VoleReservePlan {
+        local_f2,
+        remote_f2,
+        local_fe,
+        remote_fe,
+    }
+}
+
+fn reserve_plan_in_role_order<C: AbstractChannel, RNG: CryptoRng + Rng>(
+    channel: &mut C,
+    rng: &mut RNG,
+    role: PeerRole,
+    f2_local: &RcRefCell<FComProver<F40b>>,
+    f2_remote: &RcRefCell<FComVerifier<F40b>>,
+    fe_local: &RcRefCell<FComProver<F61p>>,
+    fe_remote: &RcRefCell<FComVerifier<F61p>>,
+    plan: VoleReservePlan,
+) -> Result<()> {
+    if role.is_first() {
+        f2_local
+            .get_refmut()
+            .voles_reserve(channel, rng, plan.local_f2)?;
+        f2_remote
+            .get_refmut()
+            .voles_reserve(channel, rng, plan.remote_f2)?;
+        fe_local
+            .get_refmut()
+            .voles_reserve(channel, rng, plan.local_fe)?;
+        fe_remote
+            .get_refmut()
+            .voles_reserve(channel, rng, plan.remote_fe)?;
+    } else {
+        f2_remote
+            .get_refmut()
+            .voles_reserve(channel, rng, plan.remote_f2)?;
+        f2_local
+            .get_refmut()
+            .voles_reserve(channel, rng, plan.local_f2)?;
+        fe_remote
+            .get_refmut()
+            .voles_reserve(channel, rng, plan.remote_fe)?;
+        fe_local
+            .get_refmut()
+            .voles_reserve(channel, rng, plan.local_fe)?;
+    }
+    Ok(())
+}
+
 trait BenchEdabitsPeer: Sized {
     type PreparedState;
     type CheckedState;
@@ -121,6 +273,17 @@ trait BenchEdabitsPeer: Sized {
         rng: &mut RNG,
         state: &Self::CheckedState,
     ) -> Result<()>;
+
+    fn bench_prefill_voles<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        _channel: &mut C,
+        _rng: &mut RNG,
+        _role: PeerRole,
+        _bit_size: usize,
+        _num: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     fn bench_last_check_breakdown(&self) -> Option<CheckTimeBreakdown> {
         None
@@ -171,6 +334,43 @@ impl BenchEdabitsPeer for MpcEdabitsPeer<F61p> {
         Ok(())
     }
 
+    fn bench_prefill_voles<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        role: PeerRole,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<()> {
+        let share = VoleReservePlan {
+            local_f2: 2 * num * bit_size,
+            remote_f2: 2 * num * bit_size,
+            local_fe: 2 * num,
+            remote_fe: 2 * num,
+        };
+        let (check_local_f2, check_local_fe) =
+            ProverConv::<F61p>::estimate_voles(num, bit_size as u32);
+        let (check_remote_f2, check_remote_fe) =
+            VerifierConv::<F61p>::estimate_voles(num, bit_size as u32);
+        let check = VoleReservePlan {
+            local_f2: check_local_f2,
+            remote_f2: check_remote_f2,
+            local_fe: check_local_fe,
+            remote_fe: check_remote_fe,
+        };
+        let combine = combine_reserve_plan::<F61p>(role, num, bit_size);
+        reserve_plan_in_role_order(
+            channel,
+            rng,
+            role,
+            self.fcom_f2.local(),
+            self.fcom_f2.remote(),
+            self.fcom_fe.local(),
+            self.fcom_fe.remote(),
+            share.plus(check).plus(combine),
+        )
+    }
+
     fn bench_last_check_breakdown(&self) -> Option<CheckTimeBreakdown> {
         let MpcEdabitsCheckBreakdown { aux, core } = self.last_check_breakdown();
         Some(CheckTimeBreakdown { aux, core })
@@ -219,10 +419,43 @@ impl BenchEdabitsPeer for MpcOriginalEdabitsPeer<F61p> {
         self.combine_checked_private_edabits(channel, rng, state)?;
         Ok(())
     }
+
+    fn bench_prefill_voles<C: AbstractChannel, RNG: CryptoRng + Rng>(
+        &mut self,
+        channel: &mut C,
+        rng: &mut RNG,
+        role: PeerRole,
+        bit_size: usize,
+        num: usize,
+    ) -> Result<()> {
+        let (num_bucket, num_cut) =
+            diet_mac_and_cheese::mpc_original_edabits::select_cut_and_choose_parameters(num);
+        let num_random_edabits = num * num_bucket + num_cut;
+        let num_random_triples = num * (num_bucket - 1) * bit_size + num_cut * bit_size;
+        let share = VoleReservePlan {
+            local_f2: 2 * num_random_edabits * bit_size + 6 * num_random_triples,
+            remote_f2: 2 * num_random_edabits * bit_size + 6 * num_random_triples,
+            local_fe: 2 * num_random_edabits,
+            remote_fe: 2 * num_random_edabits,
+        };
+        let num_pairs = num * (num_bucket - 1);
+        let check = combine_reserve_plan::<F61p>(role, num_pairs, bit_size).scale(2);
+        let combine = combine_reserve_plan::<F61p>(role, num, bit_size);
+        reserve_plan_in_role_order(
+            channel,
+            rng,
+            role,
+            self.fcom_f2.local(),
+            self.fcom_f2.remote(),
+            self.fcom_fe.local(),
+            self.fcom_fe.remote(),
+            share.plus(check).plus(combine),
+        )
+    }
 }
 
 macro_rules! impl_bench_chedda_peer {
-    ($peer:ty, $state:ty) => {
+    ($peer:ty, $state:ty, $dgp:ty, $dgv:ty, $pred:ty, $d2:expr, $dp:expr) => {
         impl BenchEdabitsPeer for $peer {
             type PreparedState = $state;
             type CheckedState = $state;
@@ -266,25 +499,81 @@ macro_rules! impl_bench_chedda_peer {
                 self.combine_sampled_private_edabits(channel, rng, state)?;
                 Ok(())
             }
+
+            fn bench_prefill_voles<C: AbstractChannel, RNG: CryptoRng + Rng>(
+                &mut self,
+                channel: &mut C,
+                rng: &mut RNG,
+                role: PeerRole,
+                bit_size: usize,
+                num: usize,
+            ) -> Result<()> {
+                let num_bits = bit_size * num;
+                let share = chedda_source_plan::<F61p, $dgp, $dgv, $pred, $d2, $dp>(num_bits).plus(
+                    VoleReservePlan {
+                        local_f2: num_bits,
+                        remote_f2: num_bits,
+                        local_fe: num,
+                        remote_fe: num,
+                    },
+                );
+                let check = VoleReservePlan {
+                    local_f2: ($d2 - 1) * Degree::<F40b>::USIZE,
+                    remote_f2: ($d2 - 1) * Degree::<F40b>::USIZE,
+                    local_fe: ($dp - 1) * Degree::<F61p>::USIZE,
+                    remote_fe: ($dp - 1) * Degree::<F61p>::USIZE,
+                };
+                let combine = combine_reserve_plan::<F61p>(role, num, bit_size);
+                reserve_plan_in_role_order(
+                    channel,
+                    rng,
+                    role,
+                    self.fcom_f2.local(),
+                    self.fcom_f2.remote(),
+                    self.fcom_fe.local(),
+                    self.fcom_fe.remote(),
+                    share.plus(check).plus(combine),
+                )
+            }
         }
     };
 }
 
 impl_bench_chedda_peer!(
     MpcCheddaEdabitsV1TSPAPeer<F61p>,
-    TSPAUncheckedPrivateEdabitState<F61p>
+    TSPAUncheckedPrivateEdabitState<F61p>,
+    ChedDabitGeneratorProverV1<F61p>,
+    ChedDabitGeneratorVerifierV1<F61p>,
+    TSPAPredicate,
+    { TSPAPredicate::D2 },
+    { TSPAPredicate::DP }
 );
 impl_bench_chedda_peer!(
     MpcCheddaEdabitsV2TSPAPeer<F61p>,
-    TSPAUncheckedPrivateEdabitState<F61p>
+    TSPAUncheckedPrivateEdabitState<F61p>,
+    ChedDabitGeneratorProverV2<F61p>,
+    ChedDabitGeneratorVerifierV2<F61p>,
+    TSPAPredicate,
+    { TSPAPredicate::D2 },
+    { TSPAPredicate::DP }
 );
 impl_bench_chedda_peer!(
     MpcCheddaEdabitsV1Xor4Maj7Peer<F61p>,
-    Xor4Maj7UncheckedPrivateEdabitState<F61p>
+    Xor4Maj7UncheckedPrivateEdabitState<F61p>,
+    ChedDabitGeneratorProverV1<F61p>,
+    ChedDabitGeneratorVerifierV1<F61p>,
+    Xor4Maj7Predicate,
+    { Xor4Maj7Predicate::D2 },
+    { Xor4Maj7Predicate::DP }
 );
 impl_bench_chedda_peer!(
     MpcCheddaEdabitsV2Xor4Maj7Peer<F61p>,
-    Xor4Maj7UncheckedPrivateEdabitState<F61p>
+    Xor4Maj7UncheckedPrivateEdabitState<F61p>,
+    ChedDabitGeneratorProverV2<F61p>,
+    ChedDabitGeneratorVerifierV2<F61p>,
+    Xor4Maj7Predicate,
+    { Xor4Maj7Predicate::D2 },
+    { Xor4Maj7Predicate::DP }
 );
 
 fn capture_phase(channel: &TrackUnixChannel, start: Instant) -> PhaseMetrics {
@@ -305,6 +594,10 @@ fn run_party<P: BenchEdabitsPeer>(
     let init_start = Instant::now();
     let mut peer = P::bench_init(channel, &mut rng, role, LPN_SETUP, LPN_EXTEND)
         .expect("peer initialization failed");
+    if PREFILL_VOLES_IN_INIT {
+        peer.bench_prefill_voles(channel, &mut rng, role, bit_size, num_edabits)
+            .expect("VOLE prefill failed");
+    }
     let init = capture_phase(channel, init_start);
     channel.clear();
 
@@ -450,18 +743,22 @@ fn warm_up(benches: &[BenchSpec]) {
 
 fn main() {
     let benches: &[BenchSpec] = &[
-        BenchSpec::new::<MpcEdabitsPeer<F61p>>("mpc_edabits"),
-        BenchSpec::new::<MpcOriginalEdabitsPeer<F61p>>("mpc_original_edabits"),
-        BenchSpec::new::<MpcCheddaEdabitsV1TSPAPeer<F61p>>("mpc_chedda (v1, tspa)"),
-        BenchSpec::new::<MpcCheddaEdabitsV2TSPAPeer<F61p>>("mpc_chedda (v2, tspa)"),
+        // BenchSpec::new::<MpcEdabitsPeer<F61p>>("mpc_edabits"),
+        // BenchSpec::new::<MpcOriginalEdabitsPeer<F61p>>("mpc_original_edabits"),
+        // BenchSpec::new::<MpcCheddaEdabitsV1TSPAPeer<F61p>>("mpc_chedda (v1, tspa)"),
+        // BenchSpec::new::<MpcCheddaEdabitsV2TSPAPeer<F61p>>("mpc_chedda (v2, tspa)"),
         BenchSpec::new::<MpcCheddaEdabitsV1Xor4Maj7Peer<F61p>>("mpc_chedda (v1, xor4maj7)"),
-        BenchSpec::new::<MpcCheddaEdabitsV2Xor4Maj7Peer<F61p>>("mpc_chedda (v2, xor4maj7)"),
+        // BenchSpec::new::<MpcCheddaEdabitsV2Xor4Maj7Peer<F61p>>("mpc_chedda (v2, xor4maj7)"),
     ];
 
     let total_runs = BIT_SIZES.len() * NUM_EDABITS.len() * benches.len();
-    println!("EdaBits generation benchmark (field = F61p, simulated WAN topology, no bandwidth throttling)");
+    println!("EdaBits generation benchmark (field = F61p, no bandwidth throttling)");
     println!("Phase split:");
-    println!("  init        = one-time VOLE/FCom setup");
+    if PREFILL_VOLES_IN_INIT {
+        println!("  init        = one-time VOLE/FCom setup plus estimated VOLE prefill");
+    } else {
+        println!("  init        = one-time VOLE/FCom setup");
+    }
     println!("  share       = sample/share/authenticate the private tuples");
     println!("  check       = protocol-specific consistency check");
     println!("  check_aux   = only for mpc_edabits: auxiliary random edabits/dabits");
