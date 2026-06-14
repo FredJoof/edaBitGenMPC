@@ -31,33 +31,24 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 /// EdaBit bit lengths to sweep over.
-const BIT_SIZES: &[usize] = &[32];
+const BIT_SIZES: &[usize] = &[8,32];
 
-/// Number of edaBits to generate per run, swept independently of bit length.
-/// The cut-and-choose parameter selection (shared by all protocols here)
-/// asserts `num_edabits >= 1024`, so the sweep can't go below that.
-const NUM_EDABITS: &[usize] = &[1024, 4096, 16_384, 65_536, 262_144];
+/// Number of edaBits to generate per run
+const NUM_EDABITS: &[usize] = &[4_096, 16_384];
 
-/// LPN parameters shared by all protocols. `SMALL` keeps the sweep fast;
-/// switch to `LPN_SETUP_MEDIUM`/`LPN_EXTEND_MEDIUM` for more realistic
-/// large-batch numbers (at the cost of much longer `init` phases).
+/// LPN parameters shared by all protocols.
 const LPN_SETUP: LpnParams = LPN_SETUP_SMALL;
 const LPN_EXTEND: LpnParams = LPN_EXTEND_SMALL;
 
-/// If enabled, reserve the estimated VOLE working set immediately after
-/// `bench_init`, so later lazy refills are charged to `init`.
 const PREFILL_VOLES_IN_INIT: bool = true;
 
-/// Small hidden warm-up to reduce first-run noise without doubling the real
-/// benchmark cost for large batches.
 const WARMUP_BIT_SIZE: usize = 32;
 const WARMUP_NUM_EDABITS: usize = 1024;
 const WARMUP_ROUNDS: usize = 1;
 
 const FDABIT_SECURITY_PARAMETER: usize = 38;
 
-/// Wall-clock time and total communication (both directions, in kilobits) for
-/// a single protocol phase, combined across both parties.
+/// Wall-clock time and total communication (both directions, in kilobits)
 #[derive(Clone, Copy, Debug, Default)]
 struct PhaseMetrics {
     time: Duration,
@@ -640,13 +631,6 @@ fn run_party<P: BenchEdabitsPeer>(
     }
 }
 
-/// Runs a single (implementation, bit_size, num_edabits) combination end to
-/// end and combines the two parties' metrics: time is the wall-clock max
-/// (the phase isn't done until both parties finish) and communication is
-/// summed (each party's view double-counts the same bits, once as sent and
-/// once as received, so summing both parties' totals would double-count
-/// again -- we instead take a single party's combined sent+received, which
-/// already accounts for the full bidirectional exchange).
 fn run_bench<P>(implementation: &'static str, bit_size: usize, num_edabits: usize) -> BenchResult
 where
     P: BenchEdabitsPeer + 'static,
@@ -743,11 +727,11 @@ fn warm_up(benches: &[BenchSpec]) {
 
 fn main() {
     let benches: &[BenchSpec] = &[
-        // BenchSpec::new::<MpcEdabitsPeer<F61p>>("mpc_edabits"),
+        BenchSpec::new::<MpcEdabitsPeer<F61p>>("mpc_edabits"),
         // BenchSpec::new::<MpcOriginalEdabitsPeer<F61p>>("mpc_original_edabits"),
-        // BenchSpec::new::<MpcCheddaEdabitsV1TSPAPeer<F61p>>("mpc_chedda (v1, tspa)"),
+        BenchSpec::new::<MpcCheddaEdabitsV1TSPAPeer<F61p>>("mpc_chedda (v1, tspa)"),
         // BenchSpec::new::<MpcCheddaEdabitsV2TSPAPeer<F61p>>("mpc_chedda (v2, tspa)"),
-        BenchSpec::new::<MpcCheddaEdabitsV1Xor4Maj7Peer<F61p>>("mpc_chedda (v1, xor4maj7)"),
+        // BenchSpec::new::<MpcCheddaEdabitsV1Xor4Maj7Peer<F61p>>("mpc_chedda (v1, xor4maj7)"),
         // BenchSpec::new::<MpcCheddaEdabitsV2Xor4Maj7Peer<F61p>>("mpc_chedda (v2, xor4maj7)"),
     ];
 

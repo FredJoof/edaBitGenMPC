@@ -1,26 +1,5 @@
 #![allow(clippy::too_many_arguments)]
 
-//! Peer-oriented edaBits / A2B flow built on top of the repository's VOLE/tag
-//! machinery with explicit authenticated secret shares.
-//!
-//! Correspondence with the ZK-oriented code:
-//! - [`crate::mpc_homcom`] mirrors [`crate::homcom`] with bidirectional,
-//!   peer-facing initialization.
-//! - [`crate::mpc_conv`] adds `private_edabits` and `global_edabits` on top of
-//!   the owner/checker proof views from [`crate::conv`].
-//! - This module mirrors [`crate::edabits`] at the orchestration level, but the
-//!   output is now the final combined authenticated secret-shared
-//!   `global_edabits` rather than separate owner/checker views.
-//!
-//! The global-combine step follows the paper's Figure 3 structure in 2-party
-//! form:
-//! - add the private bit contributions with a ripple-carry adder directly over
-//!   authenticated secret-shared bits
-//! - use QuickSilver-checked shared bit triples for the carry ANDs
-//! - convert the overflow carry bits to authenticated field shares with shared
-//!   dabits
-//! - subtract the `2^m` overflow correction from the summed arithmetic shares
-
 use crate::edabits::{ProverConv, VerifierConv};
 use crate::mpc_conv::{
     AuthenticatedShare, GlobalEdabit, PrivateEdabit, PrivateEdabitState, SharedEdabit,
@@ -65,7 +44,6 @@ pub fn select_cut_and_choose_parameters(num_edabits: usize) -> (usize, usize) {
     crate::mpc_edabits_common::select_cut_and_choose_parameters(num_edabits)
 }
 
-/// MPC-facing peer that owns both directions of the A2B flow.
 pub struct MpcEdabitsPeer<FE: FiniteField> {
     role: PeerRole,
     pub fcom_f2: PeerFieldMacs<F40b>,
@@ -461,9 +439,6 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
         )
     }
 
-    /// Sampling/input stage for `private_edabits` using owner/0 sharing:
-    /// the owner keeps the full authenticated share of each local contribution
-    /// and the peer receives a literal authenticated zero share.
     pub fn sample_and_share_private_edabits_owner_zero<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
@@ -480,8 +455,7 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
         )
     }
 
-    /// Run the existing conversion-consistency check on previously sampled
-    /// private edaBits.
+    /// Run the existing conversion-consistency check on previously sampled private edaBits.
     pub fn verify_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
@@ -601,8 +575,7 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
         Ok(())
     }
 
-    /// Combine the authenticated-share `private_edabits` into final
-    /// authenticated-share `global_edabits`.
+    /// Combine the authenticated-share `private_edabits` into final authenticated-share `global_edabits`.
     pub fn combine_private_into_global_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
@@ -640,8 +613,6 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
         )
     }
 
-    /// Full MPC flow using owner/0 input sharing for the private contribution
-    /// layer before the existing global-combine step.
     pub fn generate_global_edabits_owner_zero<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
@@ -673,7 +644,6 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
         self.combine_private_into_global_edabits(channel, rng, &state)
     }
 
-    /// Backwards-compatible alias for the new final `global_edabits` output.
     pub fn generate_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
@@ -684,8 +654,6 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
         self.generate_global_edabits(channel, rng, bit_size, num)
     }
 
-    /// Backwards-compatible alias for the owner/0 private-input-sharing
-    /// variant.
     pub fn generate_edabits_owner_zero<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
@@ -706,13 +674,6 @@ impl<FE: FiniteField<PrimeField = FE>> MpcEdabitsPeer<FE> {
     }
 
     /// Aggregate VOLE estimate for the full peer-facing flow.
-    ///
-    /// The additional VOLE cost covers:
-    /// - distributing the secret-shared `private_edabits`
-    /// - QuickSilver-checked shared bit triples for the ripple-carry AND gates
-    /// - checked shared dabits for overflow-bit conversion
-    ///
-    /// This is a coarse estimate for the new MPC-specific combine path.
     pub fn estimate_voles(num: usize, bit_size: u32) -> (usize, usize) {
         estimate_combine_voles::<FE>(num, bit_size)
     }

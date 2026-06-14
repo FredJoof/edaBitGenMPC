@@ -1,14 +1,3 @@
-//! MPC-oriented wrappers around the directional VOLE/tag functionality in
-//! [`crate::homcom`].
-//!
-//! Correspondence with the ZK-oriented code:
-//! - [`crate::homcom`] exposes one direction for values owned by the sender
-//!   (`FComProver`) and one direction for values checked by the receiver
-//!   (`FComVerifier`).
-//! - This module packages both directions into a peer-facing field backend so a
-//!   single MPC peer can both distribute its own shares and authenticate the
-//!   peer's shares on the same channel.
-
 use crate::edabits::RcRefCell;
 use crate::homcom::{FComProver, FComVerifier, MacProver, MacVerifier};
 use eyre::Result;
@@ -16,15 +5,11 @@ use ocelot::svole::wykw::LpnParams;
 use rand::{CryptoRng, Rng};
 use scuttlebutt::{field::FiniteField, AbstractChannel};
 
-/// Local authenticated value owned by the current peer.
+
 pub type LocalAuth<FE> = MacProver<FE>;
 
-/// Authentication state held by the current peer for a value owned by the peer
-/// on the other side of the channel.
 pub type RemoteAuth<FE> = MacVerifier<FE>;
 
-/// Fixed ordering used to turn the directional homcom setup into a peer-facing
-/// API without exposing prover/verifier terminology to callers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerRole {
     /// This peer initializes its outbound VOLE/auth direction first.
@@ -50,8 +35,6 @@ pub struct PeerFieldMacs<FE: FiniteField> {
 }
 
 impl<FE: FiniteField> PeerFieldMacs<FE> {
-    /// Initialize the two directional homcom instances in a role-dependent
-    /// order so both peers can call the same API symmetrically.
     pub fn init<C: AbstractChannel, RNG: CryptoRng + Rng>(
         channel: &mut C,
         rng: &mut RNG,

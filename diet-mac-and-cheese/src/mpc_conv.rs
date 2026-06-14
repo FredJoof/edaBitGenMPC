@@ -1,21 +1,7 @@
-//! MPC-facing edaBit types built around authenticated secret shares.
-//!
-//! Correspondence with the ZK-oriented code:
-//! - [`crate::conv::EdabitsProver`] and [`crate::conv::EdabitsVerifier`] are
-//!   still used internally for the owner/checker consistency proof.
-//! - This module adds the MPC-facing state on top: `private_edabits` are
-//!   per-party contributions that also exist as authenticated secret shares,
-//!   while `global_edabits` are the final combined authenticated secret shares.
-
 use crate::conv::{EdabitsProver, EdabitsVerifier};
 use crate::mpc_homcom::{LocalAuth, RemoteAuth};
 use scuttlebutt::field::{F40b, FiniteField, F2};
 
-/// A current-peer view of a single authenticated secret share.
-///
-/// `local` is the additive share owned by the current peer and authenticated
-/// towards the peer on the other side of the channel. `remote` is the
-/// authentication state held for the peer's additive share.
 #[derive(Clone, Copy, Debug)]
 pub struct AuthenticatedShare<FE: FiniteField> {
     pub local: LocalAuth<FE>,
@@ -42,9 +28,6 @@ impl<FE: FiniteField> SharedEdabit<FE> {
 }
 
 /// A private edaBit contribution sampled by the current peer.
-///
-/// The sampler keeps the clear value for the local proof/check path, but the
-/// same contribution also exists as authenticated secret shares in `shared`.
 #[derive(Clone, Debug)]
 pub struct PrivateEdabit<FE: FiniteField> {
     pub clear_bits: Vec<F2>,

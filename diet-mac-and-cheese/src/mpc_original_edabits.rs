@@ -1,22 +1,4 @@
 #![allow(clippy::too_many_arguments)]
-
-//! Peer-oriented 2PC implementation of the original edaBits paper flow.
-//!
-//! Correspondence with the repository:
-//! - [`crate::mpc_homcom`] provides the peer-facing VOLE/tag backend.
-//! - [`crate::mpc_conv`] provides the authenticated-share `private_edabits` and
-//!   `global_edabits` types.
-//! - This module mirrors the original paper's private-edaBit cut-and-choose:
-//!   private edaBits and private triples are sampled and shared, a random cut
-//!   set is opened, and the remaining buckets are checked with faulty triples.
-//!
-//! The final combine still follows the paper's Figure 3 structure:
-//! - add the private bit contributions with a ripple-carry adder over
-//!   authenticated secret-shared bits
-//! - convert the overflow carry bits into authenticated field shares
-//! - subtract `2^m` times the carry contribution from the summed arithmetic
-//!   shares
-
 use crate::edabits::{ProverConv, VerifierConv};
 use crate::mpc_conv::{AuthenticatedShare, GlobalEdabit, PrivateEdabit, SharedEdabit};
 use crate::mpc_edabits_common::{
@@ -85,7 +67,6 @@ struct VerifiedPrivateEdabitState<FE: FiniteField> {
     peer_private_edabits: Vec<SharedEdabit<FE>>,
 }
 
-/// Opaque checkpoint for benchmarking the original cut-and-choose pipeline.
 pub struct SampledPrivateEdabitState<FE: FiniteField> {
     bit_size: usize,
     num_bucket: usize,
@@ -93,7 +74,6 @@ pub struct SampledPrivateEdabitState<FE: FiniteField> {
     raw: RawPrivateEdabitState<FE>,
 }
 
-/// Opaque checkpoint after the original cut-and-choose checks have completed.
 pub struct CheckedPrivateEdabitState<FE: FiniteField> {
     verified: VerifiedPrivateEdabitState<FE>,
 }
@@ -661,8 +641,6 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         self.combine_private_into_global_edabits(channel, rng, &verified)
     }
 
-    /// Sample/share the raw private edaBits and triples used by the original
-    /// cut-and-choose protocol, without running the checks yet.
     pub fn sample_and_share_private_edabits_unchecked<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
@@ -688,7 +666,6 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         })
     }
 
-    /// Run the original cut-and-choose check on previously sampled material.
     pub fn verify_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
@@ -706,8 +683,6 @@ impl<FE: FiniteField<PrimeField = FE>> MpcOriginalEdabitsPeer<FE> {
         Ok(CheckedPrivateEdabitState { verified })
     }
 
-    /// Combine a previously checked original-protocol state into final global
-    /// edaBits.
     pub fn combine_checked_private_edabits<C: AbstractChannel, RNG: CryptoRng + Rng>(
         &mut self,
         channel: &mut C,
